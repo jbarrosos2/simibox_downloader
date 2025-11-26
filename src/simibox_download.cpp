@@ -15,6 +15,7 @@
 #include "esp_http_client.h"
 #include "esp_crt_bundle.h"
 #include "cJSON.h"
+#include "driver/gpio.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -90,33 +91,66 @@ void simibox_download::init_wifi(const char* ssid, const char* pass) {
 }
 
 void simibox_download::mount_sd(const char* mount_point) {
+    ESP_LOGI(TAG, "Initializing SD card...");
+    
+    // Configure GPIO pull-ups (critical for ESP-IDF)
+    gpio_set_pull_mode(GPIO_NUM_19, GPIO_PULLUP_ONLY);  // MISO
+    gpio_set_pull_mode(GPIO_NUM_23, GPIO_PULLUP_ONLY);  // MOSI  
+    gpio_set_pull_mode(GPIO_NUM_18, GPIO_PULLUP_ONLY);  // SCLK
+    gpio_set_pull_mode(GPIO_NUM_5, GPIO_PULLUP_ONLY);   // CS
+    
+    vTaskDelay(pdMS_TO_TICKS(10));
+    
     spi_bus_config_t buscfg = {};
     buscfg.miso_io_num = GPIO_NUM_19;
     buscfg.mosi_io_num = GPIO_NUM_23;
     buscfg.sclk_io_num = GPIO_NUM_18;
-    buscfg.max_transfer_sz = 4000;
-    ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO));
-
+    buscfg.max_transfer_sz = 32768;  // 32KB for better performance
+    
+    // Handle potential re-initialization
+    esp_err_t ret = spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO);
+    if (ret == ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(TAG, "SPI already initialized, resetting...");
+        spi_bus_free(SPI2_HOST);
+        vTaskDelay(pdMS_TO_TICKS(50));
+        ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO));
+    } else {
+        ESP_ERROR_CHECK(ret);
+    }
+    
     sdspi_device_config_t slotcfg = SDSPI_DEVICE_CONFIG_DEFAULT();
     slotcfg.gpio_cs = GPIO_NUM_5;
     slotcfg.host_id = SPI2_HOST;
-
+    
     sdmmc_host_t host = SDSPI_HOST_DEFAULT();
-    host.max_freq_khz = 20 * 1000;
-
+    host.slot = SPI2_HOST;
+    host.max_freq_khz = 30000;  // 7.5 MHz - your sweet spot
+    
     esp_vfs_fat_sdmmc_mount_config_t mcfg = {};
     mcfg.format_if_mount_failed = false;
     mcfg.max_files = 5;
-
-    // Use the global card handle
-    esp_err_t ret = esp_vfs_fat_sdspi_mount(mount_point, &host, &slotcfg, &mcfg, &s_card);
+    mcfg.allocation_unit_size = 8 * 1024;
+    
+    // Mount with retry logic
+    for (int retry = 0; retry < 3; retry++) {
+        ret = esp_vfs_fat_sdspi_mount(mount_point, &host, &slotcfg, &mcfg, &s_card);
+        if (ret == ESP_OK) {
+            break;
+        }
+        ESP_LOGW(TAG, "SD mount attempt %d failed: %s", retry + 1, esp_err_to_name(ret));
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to mount SD card: %s", esp_err_to_name(ret));
         return;
     }
-
+    
+    // Print card infos
+    sdmmc_card_print_info(stdout, s_card);
+    
     uint64_t mb = (uint64_t)s_card->csd.capacity * s_card->csd.sector_size / (1024ULL * 1024ULL);
-    ESP_LOGI(TAG, "SD card mounted (%llu MB)", mb);
+    ESP_LOGI(TAG, "SD card mounted (%llu MB) - SPI @ 7.5 MHz", mb);
 }
 
 void simibox_download::unmount_sd(const char* mount_point) {
@@ -425,9 +459,12 @@ bool simibox_download::download_simi_folder(const std::string& folder,
         dl_cfg.transport_type = HTTP_TRANSPORT_OVER_SSL;
         dl_cfg.crt_bundle_attach = esp_crt_bundle_attach;
         dl_cfg.timeout_ms = 300000;
-        dl_cfg.buffer_size = 8 * 1024;
-        dl_cfg.buffer_size_tx = 8 * 1024;
+        dl_cfg.buffer_size = 8 * 1024;      // Increased from 8KB
+        dl_cfg.buffer_size_tx = 8 * 1024;   // Increased from 8KB
         dl_cfg.keep_alive_enable = true;
+        dl_cfg.keep_alive_idle = 30;
+        dl_cfg.keep_alive_interval = 10;
+        dl_cfg.keep_alive_count = 3;
 
         esp_http_client_handle_t cli = esp_http_client_init(&dl_cfg);
         if (!cli) { ESP_LOGE(TAG, "http init failed"); all_ok = false; continue; }
@@ -457,15 +494,27 @@ bool simibox_download::download_simi_folder(const std::string& folder,
             ESP_LOGE(TAG, "create failed: %s", out_part.c_str());
             esp_http_client_close(cli);
             esp_http_client_cleanup(cli);
-            all_ok = false; continue;
+            all_ok = false; 
+            continue;
         }
+        
+        // Set file buffer for better write performance
+        setvbuf(f, NULL, _IOFBF, 16 * 1024);  // 32KB file buffer
 
-        uint8_t* buf = (uint8_t*)malloc(8 * 1024);
+        // Allocate 32KB buffer for reading
+        uint8_t* buf = (uint8_t*)malloc(16 * 1024);
         int total = 0, n;
-        while ((n = esp_http_client_read(cli, (char*)buf, 8 * 1024)) > 0) {
-            if (fwrite(buf, 1, n, f) != (size_t)n) { ESP_LOGE(TAG, "write error"); n = -1; break; }
+        
+        // Read with full 32KB buffer
+        while ((n = esp_http_client_read(cli, (char*)buf, 16 * 1024)) > 0) {
+            if (fwrite(buf, 1, n, f) != (size_t)n) { 
+                ESP_LOGE(TAG, "write error"); 
+                n = -1; 
+                break; 
+            }
             total += n;
         }
+        
         free(buf);
         esp_http_client_close(cli);
         esp_http_client_cleanup(cli);
