@@ -10,7 +10,7 @@
 extern "C" {
 #endif
 
-#define LED_R_PIN 14
+#define LED_R_PIN 13  // Moved from GPIO14 (now used by SDMMC CLK)
 #define LED_G_PIN 27
 #define LED_B_PIN 12
 

@@ -5,8 +5,9 @@
 namespace simibox_download {
 
 void init_wifi(const char* ssid, const char* pass);
-void mount_sd(const char* mount_point);
+bool mount_sd(const char* mount_point);  // Returns false if mount fails
 void unmount_sd(const char* mount_point);
+void force_clean_sd_bus();  // Call at boot BEFORE mount to ensure clean state after crashes
 
 // Downloads folder to /sdcard/<folder>.tmp/, verifies via manifest.json,
 // then atomically renames to /sdcard/<folder>/ on success.
