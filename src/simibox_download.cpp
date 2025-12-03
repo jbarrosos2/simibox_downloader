@@ -18,6 +18,7 @@
 #include "driver/gpio.h"
 #include "soc/gpio_reg.h"      // GPIO register addresses
 #include "rom/ets_sys.h"       // For ets_delay_us
+#include "esp_heap_caps.h"     // For DMA-capable allocation
 
 #include <cstdio>
 #include <cstdlib>
@@ -41,7 +42,7 @@ static const char* TAG_SD = "SD_DIAG";  // Separate tag for SD diagnostics
 #define SD_MOSI_PIN     23
 #define SD_MISO_PIN     19
 #define SD_CLK_PIN      18
-#define SD_SPI_FREQ_KHZ 17500  // Reduced from 7500 for sustained write reliability
+#define SD_SPI_FREQ_KHZ 12000  // Reduced from 7500 for sustained write reliability
 
 // RFID shares SPI bus
 #define RFID_SS_PIN     21
@@ -835,7 +836,8 @@ bool simibox_download::mount_sd(const char* mount_point) {
     esp_vfs_fat_sdmmc_mount_config_t mount_config = {};
     mount_config.format_if_mount_failed = false;
     mount_config.max_files = 5;
-    mount_config.allocation_unit_size = 16 * 1024;
+    // Increased allocation unit for fewer FAT operations (reduces fragmentation overhead)
+    mount_config.allocation_unit_size = 32 * 1024;
     
     ESP_LOGI(TAG_SD, "  Mount Configuration:");
     ESP_LOGI(TAG_SD, "    Format on fail:  %s", mount_config.format_if_mount_failed ? "YES" : "NO");
@@ -1224,27 +1226,43 @@ bool simibox_download::verify_download_integrity(const std::string& folder_abs_p
     return all_ok;
 }
 
-// ─────────────────────── File Download ──────────────────────────
-static const int READ_BUF_SIZE = 8192;
+// ═══════════════════════════════════════════════════════════════════════════════
+//                    HIGH-THROUGHPUT FILE DOWNLOAD
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// OPTIMIZATION NOTES:
+// - ftruncate() on ESP-IDF FAT actually WRITES ZEROS (not sparse allocation)
+//   so we skip it entirely - it was doubling download time!
+// - Large buffers (32KB) reduce syscall overhead
+// - Minimal fflush/fsync - only at end (SD cards have internal write caching)
+// - DMA-capable buffers for best SPI throughput
+//
+// At 12.5MHz SPI, theoretical max is ~1.5MB/s. Realistic with FAT overhead: 300-500KB/s
+// WiFi + TLS overhead typically limits us to 150-250KB/s in practice.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Large buffer for fewer syscalls - 32KB is a good balance
+// Must be DMA-capable (internal RAM) for best SD performance
+static const int READ_BUF_SIZE = 32 * 1024;
 
 static bool download_file_standalone(const std::string& url, const std::string& out_path) {
     int64_t t0 = esp_timer_get_time();
     
     std::string out_part = out_path + ".part";
     
-    // Log URL length for debugging (S3 pre-signed URLs can be very long)
-    ESP_LOGI(TAG, "  URL length: %d chars", (int)url.length());
-    ESP_LOGI(TAG, "  Free heap before HTTP: %lu bytes", (unsigned long)esp_get_free_heap_size());
+    ESP_LOGD(TAG, "  URL length: %d chars", (int)url.length());
     
+    // ─────────────────────────────────────────────────────────────────────────
+    // HTTP Client Setup - optimized for throughput
+    // ─────────────────────────────────────────────────────────────────────────
     esp_http_client_config_t cfg = {};
     cfg.url = url.c_str();
     cfg.transport_type = HTTP_TRANSPORT_OVER_SSL;
     cfg.crt_bundle_attach = esp_crt_bundle_attach;
     cfg.timeout_ms = 30000;
-    // CRITICAL: S3 pre-signed URLs have very long query strings (500-1000+ chars)
-    // and S3 responses include many headers. Need large buffers.
-    cfg.buffer_size = 8192;       // Receive buffer - must handle long S3 response headers
-    cfg.buffer_size_tx = 2048;    // TX buffer - must handle long pre-signed URL in request
+    // Larger buffers = fewer TLS records = better throughput
+    cfg.buffer_size = 16384;      // 16KB receive buffer (was 8KB)
+    cfg.buffer_size_tx = 4096;    // 4KB TX buffer for long S3 URLs
     
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
     if (!client) {
@@ -1254,7 +1272,7 @@ static bool download_file_standalone(const std::string& url, const std::string& 
     
     esp_err_t err = esp_http_client_open(client, 0);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "HTTP open failed: %s, heap=%lu", esp_err_to_name(err), (unsigned long)esp_get_free_heap_size());
+        ESP_LOGE(TAG, "HTTP open failed: %s", esp_err_to_name(err));
         esp_http_client_cleanup(client);
         return false;
     }
@@ -1269,6 +1287,13 @@ static bool download_file_standalone(const std::string& url, const std::string& 
         return false;
     }
     
+    if (clen > 0) {
+        ESP_LOGI(TAG, "  Size: %" PRId64 " bytes (%.1f MB)", clen, clen / (1024.0 * 1024.0));
+    }
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // File Setup - NO preallocation (ftruncate on ESP-IDF writes zeros = slow!)
+    // ─────────────────────────────────────────────────────────────────────────
     FILE* f = fopen(out_part.c_str(), "wb");
     if (!f) {
         ESP_LOGE(TAG, "Cannot create file: %s", out_part.c_str());
@@ -1277,89 +1302,105 @@ static bool download_file_standalone(const std::string& url, const std::string& 
         return false;
     }
     
-    uint8_t* buf = (uint8_t*)malloc(READ_BUF_SIZE);
+    // Set a larger stdio buffer to reduce write syscalls
+    // This buffer is in addition to our read buffer
+    static char file_buffer[4096];
+    setvbuf(f, file_buffer, _IOFBF, sizeof(file_buffer));
+    
+    // ─────────────────────────────────────────────────────────────────────────
+    // Buffer Allocation - prefer DMA-capable memory
+    // ─────────────────────────────────────────────────────────────────────────
+    uint8_t* buf = (uint8_t*)heap_caps_malloc(READ_BUF_SIZE, MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
     if (!buf) {
-        ESP_LOGE(TAG, "Buffer allocation failed (%d bytes), heap=%lu", 
-                 READ_BUF_SIZE, (unsigned long)esp_get_free_heap_size());
+        buf = (uint8_t*)malloc(READ_BUF_SIZE);
+    }
+    if (!buf) {
+        ESP_LOGE(TAG, "Buffer allocation failed");
         fclose(f);
         esp_http_client_close(client);
         esp_http_client_cleanup(client);
         return false;
     }
     
+    // ─────────────────────────────────────────────────────────────────────────
+    // Download Loop - optimized for throughput
+    // ─────────────────────────────────────────────────────────────────────────
     int total = 0, n;
     bool write_error = false;
-    int chunks_since_flush = 0;
-    const int FLUSH_EVERY_N_CHUNKS = 16;  // Flush every ~128KB (16 * 8KB)
+    int64_t last_progress = t0;
     
     while ((n = esp_http_client_read(client, (char*)buf, READ_BUF_SIZE)) > 0) {
-        // Try write with retry
-        int write_attempts = 0;
-        const int MAX_WRITE_ATTEMPTS = 3;
-        size_t written = 0;
-        
-        while (write_attempts < MAX_WRITE_ATTEMPTS && written != (size_t)n) {
-            if (write_attempts > 0) {
-                ESP_LOGW(TAG, "Write retry %d after %zu/%d bytes", write_attempts, written, n);
-                fflush(f);
-                vTaskDelay(pdMS_TO_TICKS(100));  // Give card time to recover
-            }
-            written = fwrite(buf, 1, n, f);
-            write_attempts++;
-        }
+        size_t written = fwrite(buf, 1, n, f);
         
         if (written != (size_t)n) {
-            ESP_LOGE(TAG, "Write error after %d attempts", MAX_WRITE_ATTEMPTS);
-            write_error = true;
-            break;
-        }
-        total += n;
-        chunks_since_flush++;
-        
-        // Periodic flush to prevent card buffer overflow
-        if (chunks_since_flush >= FLUSH_EVERY_N_CHUNKS) {
-            fflush(f);
-            chunks_since_flush = 0;
-            // Small yield to let card process
+            // Retry once
+            ESP_LOGW(TAG, "  Write incomplete (%zu/%d), retrying...", written, n);
             vTaskDelay(pdMS_TO_TICKS(10));
+            
+            size_t remaining = n - written;
+            size_t written2 = fwrite(buf + written, 1, remaining, f);
+            
+            if (written2 != remaining) {
+                ESP_LOGE(TAG, "  Write failed after retry");
+                write_error = true;
+                break;
+            }
+        }
+        
+        total += n;
+        
+        // Progress logging every 2 seconds for large files
+        int64_t now = esp_timer_get_time();
+        if (clen > 500000 && (now - last_progress) > 2000000) {
+            int pct = (int)((int64_t)total * 100 / clen);
+            double elapsed = (now - t0) / 1e6;
+            double speed = (total / 1024.0) / elapsed;
+            ESP_LOGI(TAG, "  Progress: %d%% (%d KB, %.0f KB/s)", pct, total / 1024, speed);
+            last_progress = now;
         }
     }
     
+    if (n < 0) {
+        ESP_LOGE(TAG, "  HTTP read error at offset %d", total);
+        write_error = true;
+    }
+    
     free(buf);
-    buf = nullptr;
     
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
     
+    // ─────────────────────────────────────────────────────────────────────────
+    // Finalize - single sync at end (not per-chunk)
+    // ─────────────────────────────────────────────────────────────────────────
     fflush(f);
     fsync(fileno(f));
     fclose(f);
     
     if (write_error || (clen > 0 && total != clen) || total == 0) {
-        ESP_LOGE(TAG, "Download incomplete: wrote=%d expected=%" PRId64, total, clen);
+        ESP_LOGE(TAG, "Download failed: wrote=%d expected=%" PRId64, total, clen);
         unlink(out_part.c_str());
         return false;
     }
     
+    // Atomic rename
     if (rename(out_part.c_str(), out_path.c_str()) != 0) {
-        ESP_LOGE(TAG, "Rename failed: %s -> %s", out_part.c_str(), out_path.c_str());
+        ESP_LOGE(TAG, "Rename failed: %s", strerror(errno));
         unlink(out_part.c_str());
         return false;
     }
     
-    FILE* sync_file = fopen(out_path.c_str(), "rb");
-    if (sync_file) {
-        fsync(fileno(sync_file));
-        fclose(sync_file);
-    }
-    
+    // ─────────────────────────────────────────────────────────────────────────
+    // Performance Metrics
+    // ─────────────────────────────────────────────────────────────────────────
     double sec = (esp_timer_get_time() - t0) / 1e6;
     double kbs = (total / 1024.0) / (sec > 0 ? sec : 1);
     
     size_t slash_pos = out_path.rfind('/');
     std::string filename = (slash_pos != std::string::npos) ? out_path.substr(slash_pos + 1) : out_path;
     
-    ESP_LOGI(TAG, "OK %s (%d bytes) in %.2fs → %.1f KB/s", filename.c_str(), total, sec, kbs);
+    ESP_LOGI(TAG, "OK %s (%.1f MB) in %.1fs → %.0f KB/s", 
+             filename.c_str(), total / (1024.0 * 1024.0), sec, kbs);
     
     return true;
 }
@@ -1443,35 +1484,38 @@ bool simibox_download::download_simi_folder(const std::string& folder,
     }
     ESP_LOGI(TAG, "Using temp dir %s", tmp_dir.c_str());
 
-    ESP_LOGI(TAG, "=== Starting downloads ===");
-    ESP_LOGI(TAG, "Initial free heap: %lu bytes", (unsigned long)esp_get_free_heap_size());
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "═══════════════════════════════════════════════════════════════");
+    ESP_LOGI(TAG, "  DOWNLOADING %d FILES", (int)file_list.size());
+    ESP_LOGI(TAG, "═══════════════════════════════════════════════════════════════");
+    ESP_LOGI(TAG, "");
 
     // 3) Download all files
     bool all_ok = true;
     int files_downloaded = 0;
+    int64_t total_bytes = 0;
     
     for (size_t i = 0; i < file_list.size(); i++) {
         const std::string& url  = file_list[i].second;
         const std::string& name = file_list[i].first;
         
-        ESP_LOGI(TAG, "[%d/%d] Downloading: %s", (int)(i + 1), (int)file_list.size(), name.c_str());
+        ESP_LOGI(TAG, "[%d/%d] %s", (int)(i + 1), (int)file_list.size(), name.c_str());
         
         std::string out_final = tmp_dir + "/" + name;
         
+        int64_t file_start = esp_timer_get_time();
         if (!download_file_standalone(url, out_final)) {
             ESP_LOGE(TAG, "Failed to download: %s", name.c_str());
             all_ok = false;
             break;
         }
         
+        // Track stats
         files_downloaded++;
-        
-        // Give card time to recover between files (prevents thermal/power issues)
-        ESP_LOGI(TAG, "Waiting 500ms for SD card recovery...");
-        vTaskDelay(pdMS_TO_TICKS(500));
-        
-        ESP_LOGI(TAG, "After file %d: free heap = %lu bytes", 
-                 files_downloaded, (unsigned long)esp_get_free_heap_size());
+        struct stat file_st;
+        if (stat(out_final.c_str(), &file_st) == 0) {
+            total_bytes += file_st.st_size;
+        }
     }
     
     if (!all_ok) {
@@ -1482,7 +1526,15 @@ bool simibox_download::download_simi_folder(const std::string& folder,
     }
     
     double total_download_sec = (esp_timer_get_time() - total_start) / 1e6;
-    ESP_LOGI(TAG, "=== All %d files downloaded in %.2fs ===", files_downloaded, total_download_sec);
+    double avg_kbs = (total_bytes / 1024.0) / (total_download_sec > 0 ? total_download_sec : 1);
+    
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "═══════════════════════════════════════════════════════════════");
+    ESP_LOGI(TAG, "  ALL %d FILES DOWNLOADED", files_downloaded);
+    ESP_LOGI(TAG, "  Total: %" PRId64 " bytes in %.2fs (avg %.1f KB/s)", 
+             total_bytes, total_download_sec, avg_kbs);
+    ESP_LOGI(TAG, "═══════════════════════════════════════════════════════════════");
+    ESP_LOGI(TAG, "");
 
     vTaskDelay(pdMS_TO_TICKS(200));
 
@@ -1519,7 +1571,12 @@ bool simibox_download::download_simi_folder(const std::string& folder,
     vTaskDelay(pdMS_TO_TICKS(500));
     
     double total_sec = (esp_timer_get_time() - total_start) / 1e6;
-    ESP_LOGI(TAG, "=== Folder '%s' completed in %.2fs ===", folder.c_str(), total_sec);
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "═══════════════════════════════════════════════════════════════");
+    ESP_LOGI(TAG, "  FOLDER '%s' COMPLETE", folder.c_str());
+    ESP_LOGI(TAG, "  Total time: %.2fs", total_sec);
+    ESP_LOGI(TAG, "═══════════════════════════════════════════════════════════════");
+    ESP_LOGI(TAG, "");
     
     return true;
 }
