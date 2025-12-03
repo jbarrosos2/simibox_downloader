@@ -41,7 +41,7 @@ static const char* TAG_SD = "SD_DIAG";  // Separate tag for SD diagnostics
 #define SD_MOSI_PIN     23
 #define SD_MISO_PIN     19
 #define SD_CLK_PIN      18
-#define SD_SPI_FREQ_KHZ 4000  // Reduced from 7500 for sustained write reliability
+#define SD_SPI_FREQ_KHZ 17500  // Reduced from 7500 for sustained write reliability
 
 // RFID shares SPI bus
 #define RFID_SS_PIN     21
