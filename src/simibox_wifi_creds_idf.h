@@ -28,11 +28,38 @@ typedef struct {
     bool initialized;
 } wifi_creds_handle_t;
 
+// Initialize WiFi subsystem
 esp_err_t wifi_creds_init(wifi_creds_handle_t* handle);
+
+// Load saved networks from our NVS namespace
 esp_err_t wifi_creds_load(wifi_creds_handle_t* handle);
-esp_err_t wifi_creds_connect_best(wifi_creds_handle_t* handle, uint32_t timeout_ms);
-esp_err_t wifi_creds_get_current_ssid(char* ssid, size_t max_len);
+
+// Scan for APs and match against saved networks
 esp_err_t wifi_creds_scan_and_match(wifi_creds_handle_t* handle);
+
+// Connect to best saved network (scan + sort by RSSI + connect)
+esp_err_t wifi_creds_connect_best(wifi_creds_handle_t* handle, uint32_t timeout_ms);
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// NEW: Auto-connect functions (leverage ESP32's remembered network from musicbox)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Wait for connection (auto-connect or already connected)
+// ESP32 remembers last network and auto-reconnects on boot
+esp_err_t wifi_creds_wait_for_connection(uint32_t timeout_ms);
+
+// RECOMMENDED: Combined connect - tries auto-connect first, then saved networks
+// This is the function you should use in most cases!
+esp_err_t wifi_creds_connect_auto(wifi_creds_handle_t* handle, uint32_t timeout_ms);
+
+// Check if currently connected
+bool wifi_creds_is_connected(void);
+
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Get current connection info
+esp_err_t wifi_creds_get_current_ssid(char* ssid, size_t max_len);
+esp_err_t wifi_creds_get_connection_info(int8_t* rssi, uint8_t* channel);
 
 #ifdef __cplusplus
 }

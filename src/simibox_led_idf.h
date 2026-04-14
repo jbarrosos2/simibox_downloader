@@ -10,7 +10,8 @@
 extern "C" {
 #endif
 
-#define LED_R_PIN 13  // Moved from GPIO14 (now used by SDMMC CLK)
+// Hardware pins - must match schematic
+#define LED_R_PIN 14
 #define LED_G_PIN 27
 #define LED_B_PIN 12
 
@@ -26,12 +27,19 @@ extern "C" {
 
 esp_err_t led_init(void);
 void led_set_color(uint16_t r, uint16_t g, uint16_t b);
+
+// Status patterns
+void led_show_wifi_connecting(void);  // Purple breathing
+void led_show_downloading(void);      // Rainbow (constant speed) - legacy
+void led_show_download_progress(uint8_t percent);  // NEW: Rainbow that ACCELERATES!
+void led_show_success(void);          // Solid green
+void led_show_error(void);            // Slow blinking red
+void led_show_retry(void);            // Fast blinking red
+
+// Legacy - color changes with progress (red→orange→yellow→green)
 void led_show_progress(uint8_t percent);
-void led_show_wifi_connecting(void);
-void led_show_downloading(void);
-void led_show_success(void);
-void led_show_error(void);
-void led_show_retry(void);
+
+// MUST be called frequently for animations to work!
 void led_update(void);
 
 #ifdef __cplusplus
