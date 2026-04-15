@@ -1,26 +1,29 @@
-/* simibox_download.cpp - High-Throughput ESP-IDF Downloader
+/* simibox_download.cpp - EXPERIMENTAL: Two-Phase Double-Buffer Downloader
  *
- * OPTIMIZATIONS:
- * 1. HTTP connection reuse (saves TLS handshake per file: 1-3 seconds each)
- * 2. 32KB buffers for HTTP and file I/O
- * 3. Keep-alive settings
- * 4. Conditional SD diagnostics (compile-time)
- * 5. DMA-capable buffer allocation
- * 6. Single fsync at end of each file
- * 
- * LED PROGRESS:
- * - Uses accelerating rainbow pattern during download
- * - Speed increases as download progresses (visual feedback!)
- * 
+ * STRATEGY: Decouple network from SD card completely.
+ *
+ *   Phase 1 (NET→PSRAM): Download up to 3 MB into PSRAM staging buffer.
+ *           No SD writes.  WiFi/TLS gets 100% of CPU and SPI bus.
+ *           TCP window stays open → maximum throughput.
+ *
+ *   Phase 2 (PSRAM→SD):  Bulk-write the staging buffer to SD card.
+ *           No network reads.  SD gets huge sequential write → fastest pattern.
+ *           WiFi is idle, no ACK pressure.
+ *
+ * For a 6 MB file this does 2 cycles.  Each cycle downloads at peak TLS speed,
+ * then writes at peak SD speed.  The two never fight for the SPI bus.
+ *
+ * OTHER FIXES IN THIS VERSION:
+ * - HTTP connection reuse actually works (don't close() between files)
+ * - Per-phase timing instrumentation (net_time vs sd_time per file)
+ *
  * HW v2: No SD power switch (CJL2623 removed, GPIO13 is now AMP_SD_PIN).
  * SD card is always powered from 3.3V rail via TPS63001.
- * Recovery from stuck cards uses SPI bus reset only (no power cycle).
- * Skip filesystem writes on error path to avoid cascading failures.
  */
 
 #include "simibox_download.h"
 #include "downloader_config.h"
-#include "simibox_led_idf.h"  // LED progress feedback
+#include "simibox_led_idf.h"
 #include "esp_log.h"
 #include "esp_err.h"
 #include "esp_event.h"
@@ -62,21 +65,16 @@ static const char* TAG = "simibox_download";
 #define SD_MOSI_PIN     23
 #define SD_MISO_PIN     19
 #define SD_CLK_PIN      18
-// SD_SPI_FREQ_KHZ comes from downloader_config.h
 
 // RFID shares SPI bus
 #define RFID_SS_PIN     21
-#define RFID_RST_PIN    4     // Changed from GPIO2 (boot conflict) to GPIO4
-
-// NOTE: No SD power switch in hw v2 (GPIO13 is now MAX98357A SD_MODE#)
-// SD card is always powered from 3.3V rail
+#define RFID_RST_PIN    4
 
 // Store card handle globally for proper unmounting
 static sdmmc_card_t* s_card = nullptr;
 static bool s_spi_bus_initialized = false;
 
 // ───────────────────────── HTTP Connection Pool ──────────────────────────────
-// Reuse HTTP client across files to save TLS handshake overhead
 static esp_http_client_handle_t s_http_client = nullptr;
 static std::string s_http_base_host;
 
@@ -84,32 +82,20 @@ static std::string s_http_base_host;
 static int64_t s_total_expected_bytes = 0;
 static int64_t s_total_downloaded_bytes = 0;
 
+// ───────────────────────── PSRAM Staging Buffer ─────────────────────────────
+static uint8_t* s_psram_buffer = nullptr;
+static size_t   s_psram_buffer_size = 0;
+
+// Static buffer for file I/O (stays in .bss → internal DRAM)
+static char s_file_buffer[16384];
+
 // ───────────────────────── SD Power Control (hw v2: no-ops) ──────────────────
-// Hardware v2 has no SD power switch. The CJL2623 was removed and GPIO13
-// is now used for MAX98357A SD_MODE#. SD card runs directly from 3.3V rail.
-// These functions are kept as stubs so call sites don't need to change.
+static void sd_power_init(void) { }
+static void sd_power_on(void) { }
+static void sd_power_off(void) { }
 
-static void sd_power_init(void) {
-    // No SD power switch in hw v2
-}
-
-static void sd_power_on(void) {
-    // No-op: SD always powered from 3.3V rail in hw v2
-}
-
-static void sd_power_off(void) {
-    // No-op: cannot power off SD in hw v2
-}
-
-/**
- * In hw v1: physically power-cycled the SD card via P-channel MOSFET.
- * In hw v2: no power switch available. Use SPI bus reset instead.
- * Note: this is less reliable than a power cycle for recovering truly
- * stuck cards, but it's the best we can do without hardware support.
- */
 static void sd_power_cycle(void) {
     ESP_LOGW(TAG, "SD power cycle not available (hw v2) - SPI reset only");
-    // The SPI-level reset in force_clean_sd_bus() handles recovery
 }
 
 // ───────────────────────── Wi-Fi plumbing ──────────────────────────────
@@ -218,7 +204,6 @@ static void sd_diag_dump_system_state(const char* context) {
 static void sd_aggressive_card_reset(void) {
     ESP_LOGI(TAG, "Performing SD card reset sequence...");
     
-    // Configure GPIOs for bit-banging
     gpio_config_t io_conf = {};
     io_conf.pin_bit_mask = (1ULL << SD_CS_PIN) | (1ULL << SD_CLK_PIN) | (1ULL << SD_MOSI_PIN);
     io_conf.mode = GPIO_MODE_OUTPUT;
@@ -232,13 +217,12 @@ static void sd_aggressive_card_reset(void) {
     io_conf.pull_up_en = GPIO_PULLUP_ENABLE;
     gpio_config(&io_conf);
     
-    // Deselect RFID (both SS and RST)
     io_conf.pin_bit_mask = (1ULL << RFID_SS_PIN) | (1ULL << RFID_RST_PIN);
     io_conf.mode = GPIO_MODE_OUTPUT;
     io_conf.pull_up_en = GPIO_PULLUP_ENABLE;
     gpio_config(&io_conf);
     gpio_set_level((gpio_num_t)RFID_SS_PIN, 1);
-    gpio_set_level((gpio_num_t)RFID_RST_PIN, 1);  // Keep RC522 out of reset
+    gpio_set_level((gpio_num_t)RFID_RST_PIN, 1);
     
     gpio_set_level((gpio_num_t)SD_CS_PIN, 1);
     gpio_set_level((gpio_num_t)SD_CLK_PIN, 0);
@@ -295,7 +279,6 @@ static void sd_aggressive_card_reset(void) {
     }
     gpio_set_level((gpio_num_t)SD_MOSI_PIN, 1);
     
-    // Clock out response
     for (int i = 0; i < 80; i++) {
         gpio_set_level((gpio_num_t)SD_CLK_PIN, 0);
         ets_delay_us(2);
@@ -314,7 +297,6 @@ void simibox_download::force_clean_sd_bus() {
     
     SD_DIAG_SYSTEM("Pre-cleanup state");
     
-    // Cleanup existing state
     if (s_card != nullptr) {
         ESP_LOGW(TAG, "Card handle still active, unmounting first");
         esp_vfs_fat_sdcard_unmount("/sdcard", s_card);
@@ -328,17 +310,9 @@ void simibox_download::force_clean_sd_bus() {
     
     vTaskDelay(pdMS_TO_TICKS(50));
     
-    // ═══════════════════════════════════════════════════════════════════════
-    // HW v2: No physical power cycle available. Rely on SPI-level reset
-    // (sd_aggressive_card_reset) which bit-bangs the bus to recover
-    // stuck cards. Less reliable than power cycling but best available.
-    // ═══════════════════════════════════════════════════════════════════════
-    sd_power_cycle();  // No-op in hw v2, kept for code compatibility
-    
-    // Then do the SPI-level reset for good measure
+    sd_power_cycle();
     sd_aggressive_card_reset();
     
-    // Reset GPIOs to safe state (including RFID)
     gpio_config_t io_conf = {};
     io_conf.pin_bit_mask = (1ULL << SD_CS_PIN) | (1ULL << RFID_SS_PIN);
     io_conf.mode = GPIO_MODE_OUTPUT;
@@ -347,8 +321,6 @@ void simibox_download::force_clean_sd_bus() {
     gpio_config(&io_conf);
     gpio_set_level((gpio_num_t)SD_CS_PIN, 1);
     gpio_set_level((gpio_num_t)RFID_SS_PIN, 1);
-    
-    // Also keep RFID_RST high (out of reset)
     gpio_set_level((gpio_num_t)RFID_RST_PIN, 1);
     
     vTaskDelay(pdMS_TO_TICKS(100));
@@ -364,10 +336,6 @@ bool simibox_download::mount_sd(const char* mount_point) {
     
     SD_DIAG_SYSTEM("Pre-mount");
     
-    // HW v2: SD always powered, no switch to control
-    // (sd_power_init/on are no-ops but kept for code compatibility)
-    
-    // Deselect all SPI devices (including RFID RST)
     gpio_config_t io_conf = {};
     io_conf.pin_bit_mask = (1ULL << RFID_SS_PIN) | (1ULL << SD_CS_PIN) | (1ULL << RFID_RST_PIN);
     io_conf.mode = GPIO_MODE_OUTPUT;
@@ -379,7 +347,6 @@ bool simibox_download::mount_sd(const char* mount_point) {
     gpio_set_level((gpio_num_t)RFID_RST_PIN, 1);
     vTaskDelay(pdMS_TO_TICKS(50));
     
-    // Initialize SPI bus
     spi_bus_config_t bus_cfg = {};
     bus_cfg.mosi_io_num = SD_MOSI_PIN;
     bus_cfg.miso_io_num = SD_MISO_PIN;
@@ -402,7 +369,6 @@ bool simibox_download::mount_sd(const char* mount_point) {
     }
     s_spi_bus_initialized = true;
     
-    // Send dummy clocks
     gpio_set_level((gpio_num_t)SD_CS_PIN, 1);
     gpio_set_level((gpio_num_t)SD_CLK_PIN, 0);
     for (int i = 0; i < 80; i++) {
@@ -413,7 +379,6 @@ bool simibox_download::mount_sd(const char* mount_point) {
     }
     vTaskDelay(pdMS_TO_TICKS(10));
     
-    // Configure SD device
     sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
     slot_config.gpio_cs = (gpio_num_t)SD_CS_PIN;
     slot_config.host_id = SPI2_HOST;
@@ -421,9 +386,6 @@ bool simibox_download::mount_sd(const char* mount_point) {
     sdmmc_host_t host = SDSPI_HOST_DEFAULT();
     host.slot = SPI2_HOST;
     host.max_freq_khz = SD_SPI_FREQ_KHZ;
-    // Tolerate slow/cheap SD cards: their internal garbage collection can
-    // pause writes for 1-3 seconds.  Default timeout (~1s) kills the transfer.
-    // 5 seconds is generous enough for even the worst cards.
     host.command_timeout_ms = 5000;
     
     esp_vfs_fat_sdmmc_mount_config_t mount_config = {};
@@ -431,7 +393,6 @@ bool simibox_download::mount_sd(const char* mount_point) {
     mount_config.max_files = 5;
     mount_config.allocation_unit_size = 32 * 1024;
     
-    // Mount with retry
     const int max_retries = 3;
     int current_freq = SD_SPI_FREQ_KHZ;
     
@@ -466,7 +427,6 @@ bool simibox_download::mount_sd(const char* mount_point) {
         ESP_LOGE(TAG, "Mount failed: %s", esp_err_to_name(ret));
     }
     
-    // Cleanup on failure
     spi_bus_free(SPI2_HOST);
     s_spi_bus_initialized = false;
     return false;
@@ -475,11 +435,6 @@ bool simibox_download::mount_sd(const char* mount_point) {
 void simibox_download::unmount_sd(const char* mount_point, bool card_healthy) {
     ESP_LOGI(TAG, "Unmounting SD card (healthy=%s)...", card_healthy ? "yes" : "NO");
     
-    // ═══════════════════════════════════════════════════════════════════════
-    // FIX: Only attempt sync write if the card is actually working.
-    // After a mid-write failure, every SD operation (fopen, fwrite, remove)
-    // generates cascading errors that leave the card in an even worse state.
-    // ═══════════════════════════════════════════════════════════════════════
     if (card_healthy) {
         std::string sync_path = std::string(mount_point) + "/.sync";
         FILE* f = fopen(sync_path.c_str(), "w");
@@ -508,13 +463,7 @@ void simibox_download::unmount_sd(const char* mount_point, bool card_healthy) {
     }
     
     gpio_set_level((gpio_num_t)SD_CS_PIN, 1);
-    
-    // ═══════════════════════════════════════════════════════════════════════
-    // HW v2: No power cycle available. The SPI bus is released above,
-    // which is the best cleanup we can do. Musicbox will re-initialize
-    // the SPI bus and SD card from scratch on its next boot.
-    // ═══════════════════════════════════════════════════════════════════════
-    sd_power_cycle();  // No-op in hw v2
+    sd_power_cycle();
     
     ESP_LOGI(TAG, "SD card unmounted");
 }
@@ -570,7 +519,6 @@ void delete_tree(const std::string& dir) {
     rmdir(dir.c_str());
 }
 
-// Extract host from URL for connection reuse check
 std::string extract_host(const std::string& url) {
     size_t start = url.find("://");
     if (start == std::string::npos) return "";
@@ -646,33 +594,35 @@ bool simibox_download::verify_download_integrity(const std::string& folder_abs_p
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//                    HIGH-THROUGHPUT FILE DOWNLOAD
+//                    HTTP CONNECTION POOL
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// Get or create HTTP client for connection reuse
 static esp_http_client_handle_t get_http_client(const std::string& url) {
 #if HTTP_REUSE_CONNECTION
     std::string host = extract_host(url);
     
-    // If we have an existing client for the same host, reuse it
     if (s_http_client != nullptr && s_http_base_host == host) {
+        // ═══════════════════════════════════════════════════════════════════
+        // FIX: Just set the new URL.  Do NOT call close() between files!
+        // esp_http_client_open() will reuse the existing TCP+TLS connection
+        // if the host matches and keep-alive is active.
+        // This saves ~1 second of TLS handshake per file.
+        // ═══════════════════════════════════════════════════════════════════
         esp_http_client_set_url(s_http_client, url.c_str());
         return s_http_client;
     }
     
-    // Clean up old client if host changed
     if (s_http_client != nullptr) {
         esp_http_client_cleanup(s_http_client);
         s_http_client = nullptr;
     }
 #endif
     
-    // Create new client with optimized settings
     esp_http_client_config_t cfg = {};
     cfg.url = url.c_str();
     cfg.transport_type = HTTP_TRANSPORT_OVER_SSL;
     cfg.crt_bundle_attach = esp_crt_bundle_attach;
-    cfg.timeout_ms = 45000;  // Longer timeout for large files
+    cfg.timeout_ms = 45000;
     cfg.buffer_size = HTTP_BUFFER_SIZE;
     cfg.buffer_size_tx = 8192;
     cfg.keep_alive_enable = true;
@@ -693,8 +643,13 @@ static esp_http_client_handle_t get_http_client(const std::string& url) {
 static void release_http_client(esp_http_client_handle_t client, bool force_cleanup) {
 #if HTTP_REUSE_CONNECTION
     if (!force_cleanup && client == s_http_client) {
-        // Keep for reuse, just close the connection
-        esp_http_client_close(client);
+        // ═══════════════════════════════════════════════════════════════════
+        // FIX: Do NOT call esp_http_client_close() here!
+        // Closing destroys the TCP connection.  The next open() would have
+        // to do a full TCP connect + TLS handshake (~1-2 seconds).
+        // By returning without closing, the next open() reuses the
+        // existing connection via HTTP keep-alive.
+        // ═══════════════════════════════════════════════════════════════════
         return;
     }
 #endif
@@ -719,48 +674,137 @@ static void cleanup_http_pool() {
 #endif
 }
 
-// Static buffer for file I/O (avoid repeated allocation)
-static char s_file_buffer[16384];
-static uint8_t* s_download_buffer = nullptr;
-static size_t s_download_buffer_size = 0;  // actual allocated size (may be smaller if PSRAM unavailable)
+// ═══════════════════════════════════════════════════════════════════════════════
+// PSRAM Staging Buffer Management
+// ═══════════════════════════════════════════════════════════════════════════════
+
+static void ensure_psram_buffer(void) {
+    if (s_psram_buffer) return;  // Already allocated
+    
+    // Try requested size first, then fall back to smaller
+    size_t try_sizes[] = { PSRAM_STAGING_BUFFER_SIZE, 2*1024*1024, 1*1024*1024, 512*1024 };
+    
+    for (size_t i = 0; i < sizeof(try_sizes)/sizeof(try_sizes[0]); i++) {
+        s_psram_buffer = (uint8_t*)heap_caps_malloc(try_sizes[i], MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (s_psram_buffer) {
+            s_psram_buffer_size = try_sizes[i];
+            ESP_LOGI(TAG, "PSRAM staging buffer: %zu KB allocated", s_psram_buffer_size / 1024);
+            ESP_LOGI(TAG, "  PSRAM remaining: %lu KB",
+                     (unsigned long)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
+            return;
+        }
+    }
+    
+    ESP_LOGE(TAG, "CRITICAL: Cannot allocate PSRAM staging buffer!");
+}
+
+static void free_psram_buffer(void) {
+    if (s_psram_buffer) {
+        free(s_psram_buffer);
+        s_psram_buffer = nullptr;
+        s_psram_buffer_size = 0;
+    }
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// LED Progress Helper - Updates LED based on overall download progress
+// LED Progress Helper
 // ═══════════════════════════════════════════════════════════════════════════════
+
 static void update_led_progress(void) {
     if (s_total_expected_bytes > 0) {
         uint8_t percent = (uint8_t)((s_total_downloaded_bytes * 100) / s_total_expected_bytes);
         if (percent > 100) percent = 100;
         led_show_download_progress(percent);
     }
-    led_update();  // Animate the LED
+    led_update();
 }
 
-// Download result: distinguishes SD failure (card stuck) from other failures
+// ═══════════════════════════════════════════════════════════════════════════════
+//          TWO-PHASE FILE DOWNLOAD: NET→PSRAM, then PSRAM→SD
+// ═══════════════════════════════════════════════════════════════════════════════
+
 enum class DlResult { OK, SD_FAILED, NET_FAILED, OTHER_FAILED };
 
+/**
+ * Write a chunk of data from PSRAM to an open file on SD.
+ * Breaks large writes into SD_WRITE_CHUNK_SIZE pieces with yields
+ * so FreeRTOS system tasks can run.
+ * Returns false if SD write fails.
+ */
+static bool bulk_write_to_sd(FILE* f, const uint8_t* data, size_t len) {
+    // Buffer estático en DRAM (.bss). 32KB es el límite óptimo para el DMA
+    static uint8_t dram_bounce_buffer[32768]; 
+    
+    size_t offset = 0;
+    while (offset < len) {
+        size_t chunk = (len - offset > sizeof(dram_bounce_buffer)) 
+                       ? sizeof(dram_bounce_buffer) : (len - offset);
+        
+        // Copia rapidísima de PSRAM a DRAM usando la CPU
+        memcpy(dram_bounce_buffer, data + offset, chunk);
+        
+        // Escritura eficiente a SD desde DRAM, permitiendo DMA directo
+        size_t written = fwrite(dram_bounce_buffer, 1, chunk, f);
+        
+        if (written != chunk) {
+            ESP_LOGW(TAG, "  SD write stall (%zu/%zu), retrying...", written, chunk);
+            vTaskDelay(pdMS_TO_TICKS(50));
+            size_t w2 = fwrite(dram_bounce_buffer + written, 1, chunk - written, f);
+            if (written + w2 != chunk) {
+                ESP_LOGE(TAG, "  SD write FAILED at offset %zu", offset);
+                return false;
+            }
+        }
+        
+        offset += chunk;
+        
+        // Breve pausa para el watchdog
+        vTaskDelay(pdMS_TO_TICKS(1)); 
+    }
+    return true;
+}
 static DlResult download_file_standalone(const std::string& url, const std::string& out_path) {
     int64_t t0 = esp_timer_get_time();
     std::string out_part = out_path + ".part";
     
-    // Get HTTP client (may be reused)
-    esp_http_client_handle_t client = get_http_client(url);
-    if (!client) {
-        ESP_LOGE(TAG, "HTTP client init failed");
-        return DlResult::NET_FAILED;
-    }
+    // ─────── HTTP setup with stale-connection retry ───────
+    // The keep-alive connection may have died during the SD write phase
+    // (server closed it after idle timeout).  If open() or fetch_headers()
+    // fails, destroy the stale client and create a fresh one.
+    esp_http_client_handle_t client = nullptr;
+    int64_t clen = 0;
     
-    esp_err_t err = esp_http_client_open(client, 0);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "HTTP open failed: %s", esp_err_to_name(err));
-        release_http_client(client, true);
-        return DlResult::NET_FAILED;
-    }
-    
-    int64_t clen = esp_http_client_fetch_headers(client);
-    int status = esp_http_client_get_status_code(client);
-    
-    if (status != 200) {
+    for (int attempt = 0; attempt < 2; attempt++) {
+        client = get_http_client(url);
+        if (!client) {
+            ESP_LOGE(TAG, "HTTP client init failed");
+            return DlResult::NET_FAILED;
+        }
+        
+        esp_err_t err = esp_http_client_open(client, 0);
+        if (err != ESP_OK) {
+            if (attempt == 0) {
+                ESP_LOGW(TAG, "  Connection stale, reconnecting...");
+                release_http_client(client, true);  // Destroy stale client
+                continue;  // Retry with fresh connection
+            }
+            ESP_LOGE(TAG, "HTTP open failed: %s", esp_err_to_name(err));
+            release_http_client(client, true);
+            return DlResult::NET_FAILED;
+        }
+        
+        clen = esp_http_client_fetch_headers(client);
+        int status = esp_http_client_get_status_code(client);
+        
+        if (status == 200) break;  // Success
+        
+        if (status <= 0 && attempt == 0) {
+            // Stale connection returned garbage — retry with fresh
+            ESP_LOGW(TAG, "  Bad status %d on reused connection, reconnecting...", status);
+            release_http_client(client, true);
+            continue;
+        }
+        
         ESP_LOGE(TAG, "HTTP status %d", status);
         release_http_client(client, true);
         return DlResult::NET_FAILED;
@@ -770,7 +814,14 @@ static DlResult download_file_standalone(const std::string& url, const std::stri
         ESP_LOGI(TAG, "  Size: %" PRId64 " bytes (%.1f MB)", clen, clen / (1024.0 * 1024.0));
     }
     
-    // Open output file
+    // ─────── Ensure PSRAM staging buffer ───────
+    ensure_psram_buffer();
+    if (!s_psram_buffer) {
+        release_http_client(client, true);
+        return DlResult::OTHER_FAILED;
+    }
+    
+    // ─────── Open output file ───────
     FILE* f = fopen(out_part.c_str(), "wb");
     if (!f) {
         ESP_LOGE(TAG, "Cannot create file: %s", out_part.c_str());
@@ -779,132 +830,108 @@ static DlResult download_file_standalone(const std::string& url, const std::stri
     }
     setvbuf(f, s_file_buffer, _IOFBF, sizeof(s_file_buffer));
     
-    // Allocate download buffer (reuse if possible)
-    // Prefer PSRAM — this buffer is just memcpy'd to fwrite(), no DMA needed.
-    // Keeping it in PSRAM frees internal DRAM for WiFi/TLS/SPI DMA buffers.
-    if (!s_download_buffer) {
-        s_download_buffer = (uint8_t*)heap_caps_malloc(
-            DOWNLOAD_READ_BUFFER_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (s_download_buffer) {
-            s_download_buffer_size = DOWNLOAD_READ_BUFFER_SIZE;
-            ESP_LOGI(TAG, "Download buffer: %d KB in PSRAM", DOWNLOAD_READ_BUFFER_SIZE / 1024);
-        } else {
-            // Fallback: smaller buffer in internal DRAM
-            const size_t fallback_size = 16 * 1024;
-            s_download_buffer = (uint8_t*)heap_caps_malloc(
-                fallback_size, MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
-            s_download_buffer_size = fallback_size;
-            ESP_LOGW(TAG, "PSRAM alloc failed, falling back to internal DRAM (%d KB)",
-                     (int)(fallback_size / 1024));
-        }
-    }
+    // ─────── Two-phase download loop ───────
+    int total = 0;
+    bool net_error = false;
+    bool sd_error = false;
+    int64_t net_time_us = 0;
+    int64_t sd_time_us = 0;
+    int cycle_count = 0;
     
-    if (!s_download_buffer) {
-        ESP_LOGE(TAG, "Buffer allocation failed");
-        fclose(f);
-        release_http_client(client, true);
-        return DlResult::OTHER_FAILED;
-    }
-    
-    // Download loop with LED progress updates
-    int total = 0, n;
-    bool sd_write_failed = false;
-    bool net_read_failed = false;
-    int64_t last_progress = t0;
-    int led_update_counter = 0;
-    
-    while ((n = esp_http_client_read(client, (char*)s_download_buffer, s_download_buffer_size)) > 0) {
+    while (true) {
         // ═══════════════════════════════════════════════════════════════════
-        // Write in 16 KB chunks with a yield between each.
-        // A single fwrite(64KB) holds the SPI bus for ~128 sector
-        // transactions without yielding.  WiFi interrupts pile up,
-        // the SD driver times out, and the card gets stuck.
-        // 16 KB chunks + vTaskDelay(1) lets WiFi drain its ISR queue.
+        // PHASE 1: NETWORK → PSRAM
+        //
+        // Fill the staging buffer from HTTP/TLS.
+        // NO SD writes happen here.  WiFi/TLS gets 100% of CPU time.
+        // TCP window stays open, ACKs flow freely, max throughput.
         // ═══════════════════════════════════════════════════════════════════
-        const size_t WRITE_CHUNK = 16 * 1024;
-        size_t offset = 0;
+        size_t buf_filled = 0;
+        int64_t phase1_start = esp_timer_get_time();
         
-        while (offset < (size_t)n) {
-            size_t to_write = ((size_t)n - offset > WRITE_CHUNK) 
-                              ? WRITE_CHUNK : (size_t)n - offset;
-            size_t w = fwrite(s_download_buffer + offset, 1, to_write, f);
+        while (buf_filled < s_psram_buffer_size) {
+            int n = esp_http_client_read(client, 
+                (char*)s_psram_buffer + buf_filled,
+                s_psram_buffer_size - buf_filled);
             
-            if (w != to_write) {
-                ESP_LOGW(TAG, "Chunk write incomplete (%zu/%zu at offset %zu), retrying...",
-                         w, to_write, offset);
-                vTaskDelay(pdMS_TO_TICKS(10));
-                size_t w2 = fwrite(s_download_buffer + offset + w, 1, to_write - w, f);
-                if (w + w2 != to_write) {
-                    ESP_LOGE(TAG, "SD write failed after retry");
-                    sd_write_failed = true;
-                    break;
-                }
+            if (n < 0) {
+                ESP_LOGE(TAG, "  HTTP read error at total offset %d", total);
+                net_error = true;
+                break;
             }
+            if (n == 0) break;  // EOF
             
-            offset += to_write;
-            vTaskDelay(pdMS_TO_TICKS(1));
-        }
-        
-        if (sd_write_failed) break;
-        
-        total += n;
-        s_total_downloaded_bytes += n;  // Track global progress
-        
-        // Update LED every few iterations (don't slow down download)
-        led_update_counter++;
-        if (led_update_counter >= 4) {  // Every ~64KB
+            buf_filled += (size_t)n;
+            total += n;
+            s_total_downloaded_bytes += n;
+            
+            // Update LED periodically (cheap — no SD, just LEDC registers)
             update_led_progress();
-            led_update_counter = 0;
         }
         
-        // Progress logging every 3 seconds for large files
-        int64_t now = esp_timer_get_time();
-        if (clen > 500000 && (now - last_progress) > 3000000) {
-            int pct = (int)((int64_t)total * 100 / clen);
-            double elapsed = (now - t0) / 1e6;
-            double speed = (total / 1024.0) / elapsed;
-            ESP_LOGI(TAG, "  Progress: %d%% (%d KB, %.0f KB/s)", pct, total / 1024, speed);
-            last_progress = now;
+        int64_t phase1_us = esp_timer_get_time() - phase1_start;
+        net_time_us += phase1_us;
+        
+        if (net_error || buf_filled == 0) break;
+        
+        // Log phase 1 speed
+        double phase1_kbs = (buf_filled / 1024.0) / (phase1_us / 1e6);
+        cycle_count++;
+        ESP_LOGI(TAG, "  Cycle %d: downloaded %zu KB in %.1fs (%.0f KB/s net)",
+                 cycle_count, buf_filled / 1024, phase1_us / 1e6, phase1_kbs);
+        
+        // ═══════════════════════════════════════════════════════════════════
+        // PHASE 2: PSRAM → SD CARD
+        //
+        // Bulk-write the entire staging buffer to SD.
+        // NO network reads happen here.  SD gets a big sequential write
+        // which is the fastest access pattern for flash storage.
+        // WiFi is idle — TCP connection stays alive via keep-alive.
+        // ═══════════════════════════════════════════════════════════════════
+        int64_t phase2_start = esp_timer_get_time();
+        
+        if (!bulk_write_to_sd(f, s_psram_buffer, buf_filled)) {
+            sd_error = true;
+            break;
         }
+        
+        int64_t phase2_us = esp_timer_get_time() - phase2_start;
+        sd_time_us += phase2_us;
+        
+        double phase2_kbs = (buf_filled / 1024.0) / (phase2_us / 1e6);
+        ESP_LOGI(TAG, "  Cycle %d: wrote %zu KB in %.1fs (%.0f KB/s SD)",
+                 cycle_count, buf_filled / 1024, phase2_us / 1e6, phase2_kbs);
+        
+        // If we got less than a full buffer, we hit EOF in phase 1
+        if (buf_filled < s_psram_buffer_size) break;
     }
     
-    if (n < 0) {
-        ESP_LOGE(TAG, "HTTP read error at offset %d", total);
-        net_read_failed = true;
-    }
+    // ─────── Close HTTP (keep connection for reuse if no error) ───────
+    release_http_client(client, sd_error || net_error);
     
-    // Close HTTP connection (keep client for reuse if no error)
-    release_http_client(client, sd_write_failed || net_read_failed);
-    
-    // ═══════════════════════════════════════════════════════════════════════
-    // Error handling: separate SD failure from network failure.
-    //
-    // SD write failure → card is stuck, don't touch it (no flush/sync/unlink)
-    // Net read failure → card is fine, flush what we have, clean up .part file
-    // ═══════════════════════════════════════════════════════════════════════
-    if (sd_write_failed) {
-        ESP_LOGW(TAG, "Closing file without flush (SD card is stuck)");
-        fclose(f);  // Release fd only, don't try to flush
-        ESP_LOGE(TAG, "Download failed (SD write): wrote=%d expected=%" PRId64, total, clen);
+    // ─────── Error handling ───────
+    if (sd_error) {
+        ESP_LOGW(TAG, "Closing file without flush (SD card stuck)");
+        fclose(f);
+        ESP_LOGE(TAG, "FAILED (SD): wrote=%d expected=%" PRId64, total, clen);
         return DlResult::SD_FAILED;
     }
     
-    if (net_read_failed) {
-        // Card is healthy — flush what we wrote, then clean up
+    if (net_error) {
         fflush(f);
         fclose(f);
         unlink(out_part.c_str());
-        ESP_LOGE(TAG, "Download failed (network): wrote=%d expected=%" PRId64, total, clen);
+        ESP_LOGE(TAG, "FAILED (network): wrote=%d expected=%" PRId64, total, clen);
         return DlResult::NET_FAILED;
     }
     
-    // Normal path: flush, sync, close
+    // ─────── Normal path: flush, sync, close ───────
     fflush(f);
     fsync(fileno(f));
     fclose(f);
     
     if ((clen > 0 && total != clen) || total == 0) {
-        ESP_LOGE(TAG, "Download failed: wrote=%d expected=%" PRId64, total, clen);
+        ESP_LOGE(TAG, "FAILED: wrote=%d expected=%" PRId64, total, clen);
         unlink(out_part.c_str());
         return DlResult::OTHER_FAILED;
     }
@@ -916,19 +943,23 @@ static DlResult download_file_standalone(const std::string& url, const std::stri
         return DlResult::SD_FAILED;
     }
     
-    // Performance metrics
-    double sec = (esp_timer_get_time() - t0) / 1e6;
-    double kbs = (total / 1024.0) / (sec > 0 ? sec : 1);
+    // ─────── Performance report ───────
+    double total_sec = (esp_timer_get_time() - t0) / 1e6;
+    double total_kbs = (total / 1024.0) / (total_sec > 0 ? total_sec : 1);
+    double net_sec = net_time_us / 1e6;
+    double sd_sec = sd_time_us / 1e6;
     
     size_t slash_pos = out_path.rfind('/');
     std::string filename = (slash_pos != std::string::npos) ? out_path.substr(slash_pos + 1) : out_path;
     
     ESP_LOGI(TAG, "✓ %s (%.1f MB) in %.1fs → %.0f KB/s", 
-             filename.c_str(), total / (1024.0 * 1024.0), sec, kbs);
+             filename.c_str(), total / (1024.0 * 1024.0), total_sec, total_kbs);
+    ESP_LOGI(TAG, "    Breakdown: net=%.1fs (%.0f KB/s), SD=%.1fs (%.0f KB/s), overhead=%.1fs",
+             net_sec, (total / 1024.0) / (net_sec > 0 ? net_sec : 1),
+             sd_sec, (total / 1024.0) / (sd_sec > 0 ? sd_sec : 1),
+             total_sec - net_sec - sd_sec);
     
-    // Final LED update after file complete
     update_led_progress();
-    
     return DlResult::OK;
 }
 
@@ -989,7 +1020,6 @@ bool simibox_download::download_simi_folder(const std::string& folder,
             if (cJSON_IsString(filename) && cJSON_IsString(furl)) {
                 file_list.emplace_back(filename->valuestring, furl->valuestring);
                 
-                // Accumulate expected total size for progress calculation
                 if (cJSON_IsNumber(fsize)) {
                     s_total_expected_bytes += (int64_t)fsize->valuedouble;
                 }
@@ -1014,9 +1044,7 @@ bool simibox_download::download_simi_folder(const std::string& folder,
     ESP_LOGI(TAG, "Found %d files to download (%" PRId64 " bytes expected)", 
              (int)file_list.size(), s_total_expected_bytes);
     
-    // If server didn't provide sizes, estimate based on file count
     if (s_total_expected_bytes == 0) {
-        // Rough estimate: assume 2MB average per file
         s_total_expected_bytes = file_list.size() * 2 * 1024 * 1024;
         ESP_LOGW(TAG, "No size info from server, estimating %" PRId64 " bytes", s_total_expected_bytes);
     }
@@ -1036,12 +1064,13 @@ bool simibox_download::download_simi_folder(const std::string& folder,
 
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, "═══════════════════════════════════════════════════════════════");
-    ESP_LOGI(TAG, "  DOWNLOADING %d FILES", (int)file_list.size());
+    ESP_LOGI(TAG, "  DOWNLOADING %d FILES (two-phase: NET→PSRAM→SD)", (int)file_list.size());
+    ESP_LOGI(TAG, "  Staging buffer: %zu KB in PSRAM", PSRAM_STAGING_BUFFER_SIZE / 1024);
     ESP_LOGI(TAG, "═══════════════════════════════════════════════════════════════");
 
     // 3) Download all files
     bool all_ok = true;
-    bool sd_failed = false;  // Track whether SD died (for unmount decision)
+    bool sd_failed = false;
     int files_downloaded = 0;
     int64_t total_bytes = 0;
     
@@ -1051,7 +1080,6 @@ bool simibox_download::download_simi_folder(const std::string& folder,
         
         ESP_LOGI(TAG, "[%d/%d] %s", (int)(i + 1), (int)file_list.size(), name.c_str());
         
-        // Update LED before each file
         update_led_progress();
         
         std::string out_final = tmp_dir + "/" + name;
@@ -1071,27 +1099,17 @@ bool simibox_download::download_simi_folder(const std::string& folder,
         }
     }
     
-    // Cleanup HTTP pool
+    // Cleanup
     cleanup_http_pool();
-    
-    // Free download buffer
-    if (s_download_buffer) {
-        free(s_download_buffer);
-        s_download_buffer = nullptr;
-        s_download_buffer_size = 0;
-    }
+    free_psram_buffer();
     
     if (!all_ok) {
         ESP_LOGE(TAG, "Download failed after %d files", files_downloaded);
         if (out_sd_failed) *out_sd_failed = sd_failed;
         
         if (!sd_failed) {
-            // Network or other failure — card is fine, clean up temp dir
             delete_tree(tmp_dir);
         }
-        // If SD failed: do NOT call delete_tree() — card is stuck and every
-        // filesystem op generates cascading errors.  The .tmp dir will be
-        // cleaned up on the next successful download attempt.
         return false;
     }
     
