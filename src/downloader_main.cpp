@@ -85,7 +85,8 @@ static bool connect_to_wifi_debug_mode(void) {
         if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
             ESP_LOGI(TAG, "DEBUG: Connected to %s!", TEST_WIFI_SSID);
             strncpy(boot_state.last_ssid, TEST_WIFI_SSID, sizeof(boot_state.last_ssid) - 1);
-            led_set_color(0, LEDC_MAX_DUTY, 0);
+            // Solid: cancels the purple breathing so the green survives the delay
+            led_show_solid(0, LEDC_MAX_DUTY, 0);
             vTaskDelay(pdMS_TO_TICKS(1000));
             return true;
         }
@@ -187,6 +188,35 @@ static bool connect_to_wifi_with_feedback(void) {
         }
     }
     
+    // ═══════════════════════════════════════════════════════════════════════════
+    // SEGUNDA FUENTE DE CREDENCIALES
+    //
+    // Todo lo de arriba depende de la red que recuerda el driver (nvs.net80211).
+    // Es una sola ranura: si la caja cambió de lugar, o si esa ranura se perdió,
+    // no había nada más que intentar y la descarga moría acá.
+    //
+    // musicbox escribe además la lista completa en el namespace 'wifi_creds'
+    // (ver commitCredentials() en simibox_wifi_manager.h). Este bloque la usa.
+    // Es puramente aditivo: sólo corre en el camino que antes ya se daba por
+    // perdido, así que no cambia el comportamiento cuando el auto-connect anda.
+    //
+    // El comentario de más arriba decía que se usaba wifi_creds_connect_auto(),
+    // pero nadie la llamaba: el enlazador descartaba wifi_creds_load(),
+    // scan_and_match() y connect_best() por no estar referenciadas.
+    // ═══════════════════════════════════════════════════════════════════════════
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Auto-connect falló; pruebo las redes guardadas por musicbox");
+        led_show_wifi_connecting();
+
+        if (wifi_creds_load(&wifi_handle) == ESP_OK && wifi_handle.count > 0) {
+            ESP_LOGI(TAG, "%d red(es) en 'wifi_creds', intentando conectar...",
+                     wifi_handle.count);
+            ret = wifi_creds_connect_best(&wifi_handle, 20000);
+        } else {
+            ESP_LOGE(TAG, "'wifi_creds' vacío: no hay segunda fuente de credenciales");
+        }
+    }
+
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to connect to WiFi");
         led_show_error();
@@ -194,7 +224,7 @@ static bool connect_to_wifi_with_feedback(void) {
     }
     
     // Get and log connection info
-    char ssid[32] = {0};
+    char ssid[33] = {0};  // 32 caracteres de SSID + terminador
     wifi_creds_get_current_ssid(ssid, sizeof(ssid));
     ESP_LOGI(TAG, "Connected to: %s", ssid);
     
@@ -207,7 +237,8 @@ static bool connect_to_wifi_with_feedback(void) {
     strncpy(boot_state.last_ssid, ssid, sizeof(boot_state.last_ssid) - 1);
     
     // Brief green flash to confirm connection
-    led_set_color(0, LEDC_MAX_DUTY, 0);
+    // Solid: cancels the purple breathing so the green survives the delay
+    led_show_solid(0, LEDC_MAX_DUTY, 0);
     vTaskDelay(pdMS_TO_TICKS(500));
     
     return true;
@@ -353,8 +384,8 @@ extern "C" void app_main(void) {
             // This will lose the HMAC key - log a critical warning
             ESP_LOGE(TAG, "═══════════════════════════════════════════════════════════");
             ESP_LOGE(TAG, "CRITICAL: NVS still corrupt, must perform FULL erase!");
-            ESP_LOGE(TAG, "WARNING: This will DESTROY the HMAC secret key!");
-            ESP_LOGE(TAG, "Device will need to be re-provisioned after this!");
+            ESP_LOGE(TAG, "NOTE: HMAC key is SAFE (stored in 'simikey' partition, outside NVS).");
+            ESP_LOGE(TAG, "Only volatile NVS state (boot flags, WiFi creds) will be cleared.");
             ESP_LOGE(TAG, "═══════════════════════════════════════════════════════════");
             
             ESP_ERROR_CHECK(nvs_flash_erase());

@@ -67,8 +67,13 @@ esp_err_t wifi_creds_init(wifi_creds_handle_t* handle) {
     
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        ret = nvs_flash_init();
+        // Do NOT blindly nvs_flash_erase() here. NVS recovery is owned by
+        // app_main (downloader_main.c). app_main normally initializes NVS before
+        // this runs, so reaching this branch is unexpected; log and continue.
+        // (The HMAC secret now lives in the dedicated 'simikey' partition, outside
+        //  NVS, so even a full NVS erase can never destroy it.)
+        ESP_LOGW(TAG, "NVS not initialized here (%s); expected app_main to own it",
+                 esp_err_to_name(ret));
     }
     
     ESP_ERROR_CHECK(esp_netif_init());
@@ -217,16 +222,27 @@ esp_err_t wifi_creds_load(wifi_creds_handle_t* handle) {
         
         snprintf(key, sizeof(key), "%s%d", NVS_KEY_SSID_PREFIX, i);
         ret = nvs_get_str(nvs, key, handle->networks[handle->count].ssid, &ssid_len);
-        if (ret != ESP_OK) continue;
-        
+        if (ret != ESP_OK) {
+            // Antes esto se descartaba sin decir nada. Si vuelve a aparecer un
+            // caso de buffer corto queremos verlo en el log, no perder la red.
+            ESP_LOGW(TAG, "  [%d] no pude leer %s: %s", i, key, esp_err_to_name(ret));
+            continue;
+        }
+
         snprintf(key, sizeof(key), "%s%d", NVS_KEY_PASS_PREFIX, i);
         ret = nvs_get_str(nvs, key, handle->networks[handle->count].password, &pass_len);
-        if (ret != ESP_OK) continue;
-        
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "  [%d] no pude leer %s: %s", i, key, esp_err_to_name(ret));
+            continue;
+        }
+
         handle->networks[handle->count].rssi = -100;
+
+        // OJO: se indexa por handle->count, no por i. Si una red se salta, los
+        // dos índices dejan de coincidir y con `i` se imprimía una posición del
+        // arreglo todavía sin inicializar.
+        ESP_LOGI(TAG, "  [%d] %s", i, handle->networks[handle->count].ssid);
         handle->count++;
-        
-        ESP_LOGI(TAG, "  [%d] %s", i, handle->networks[i].ssid);
     }
     
     nvs_close(nvs);
@@ -252,13 +268,26 @@ esp_err_t wifi_creds_scan_and_match(wifi_creds_handle_t* handle) {
         .scan_time.active.max = 1500,
     };
     
+    // Nada de ESP_ERROR_CHECK() acá: un escaneo fallido es una condición
+    // esperable (radio ocupada, driver en transición), no un bug del programa.
+    // ESP_ERROR_CHECK hace abort() y reinicia la caja, y esta función corre
+    // justo cuando las cosas ya van mal — sería un bucle de reinicios en el
+    // peor momento posible. Devolvemos el error y que decida quien llama.
     ESP_LOGI(TAG, "Starting WiFi scan...");
-    ESP_ERROR_CHECK(esp_wifi_scan_start(&scan_cfg, true));
-    
+    esp_err_t scan_err = esp_wifi_scan_start(&scan_cfg, true);
+    if (scan_err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_wifi_scan_start: %s", esp_err_to_name(scan_err));
+        return scan_err;
+    }
+
     uint16_t ap_count = WIFI_SCAN_MAX_AP;
     wifi_ap_record_t ap_list[WIFI_SCAN_MAX_AP];
-    
-    ESP_ERROR_CHECK(esp_wifi_scan_get_ap_records(&ap_count, ap_list));
+
+    scan_err = esp_wifi_scan_get_ap_records(&ap_count, ap_list);
+    if (scan_err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_wifi_scan_get_ap_records: %s", esp_err_to_name(scan_err));
+        return scan_err;
+    }
     ESP_LOGI(TAG, "Found %d access points", ap_count);
     
     for (int i = 0; i < ap_count; i++) {
@@ -295,26 +324,61 @@ esp_err_t wifi_creds_connect_best(wifi_creds_handle_t* handle, uint32_t timeout_
         return ESP_ERR_NOT_FOUND;
     }
     
-    ESP_ERROR_CHECK(wifi_creds_scan_and_match(handle));
-    
+    // Si el escaneo falla seguimos igual: todas las redes quedan en rssi=-100 y
+    // más abajo entra el intento a ciegas con la primera guardada.
+    esp_err_t scan_ret = wifi_creds_scan_and_match(handle);
+    if (scan_ret != ESP_OK) {
+        ESP_LOGW(TAG, "Escaneo fallido (%s), sigo con las guardadas a ciegas",
+                 esp_err_to_name(scan_ret));
+    }
+
     s_is_connecting = true;
-    
+
+    // Ninguna red guardada apareció en el escaneo: probamos igual con la
+    // primera (la más reciente que guardó musicbox). Un AP con SSID oculto
+    // nunca sale en el escaneo, pero sí acepta una conexión dirigida — mismo
+    // criterio que el intento a ciegas del lado de musicbox.
+    bool anyVisible = false;
+    for (int i = 0; i < handle->count; i++) {
+        if (handle->networks[i].rssi > -100) { anyVisible = true; break; }
+    }
+    if (!anyVisible && handle->count > 0) {
+        ESP_LOGW(TAG, "Ninguna guardada visible; intento a ciegas con \"%s\"",
+                 handle->networks[0].ssid);
+        handle->networks[0].rssi = -99;  // lo hace elegible en el bucle
+    }
+
     for (int i = 0; i < handle->count; i++) {
         if (handle->networks[i].rssi <= -100) continue;
-        
-        ESP_LOGI(TAG, "Connecting to %s (RSSI: %d)...", 
+
+        ESP_LOGI(TAG, "Connecting to %s (RSSI: %d)...",
                 handle->networks[i].ssid, handle->networks[i].rssi);
-        
+
         wifi_config_t wifi_config = {0};
-        strncpy((char*)wifi_config.sta.ssid, handle->networks[i].ssid, 
+        strncpy((char*)wifi_config.sta.ssid, handle->networks[i].ssid,
                 sizeof(wifi_config.sta.ssid));
-        strncpy((char*)wifi_config.sta.password, handle->networks[i].password, 
+        strncpy((char*)wifi_config.sta.password, handle->networks[i].password,
                 sizeof(wifi_config.sta.password));
-        
-        ESP_ERROR_CHECK(esp_wifi_disconnect());
-        ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
-        ESP_ERROR_CHECK(esp_wifi_connect());
-        
+
+        // Tampoco acá usamos ESP_ERROR_CHECK: esp_wifi_connect() puede fallar
+        // por causas normales (config inválida, radio ocupada). Si esta red no
+        // se puede intentar, pasamos a la siguiente en vez de reiniciar.
+        esp_wifi_disconnect();  // puede devolver NOT_CONNECTED, es esperable
+
+        esp_err_t cfg_err = esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+        if (cfg_err != ESP_OK) {
+            ESP_LOGE(TAG, "set_config para \"%s\": %s",
+                     handle->networks[i].ssid, esp_err_to_name(cfg_err));
+            continue;
+        }
+
+        esp_err_t con_err = esp_wifi_connect();
+        if (con_err != ESP_OK) {
+            ESP_LOGE(TAG, "esp_wifi_connect para \"%s\": %s",
+                     handle->networks[i].ssid, esp_err_to_name(con_err));
+            continue;
+        }
+
         // Re-apply throughput optimizations after config change
         esp_wifi_set_ps(WIFI_PS_NONE);
         esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT40);

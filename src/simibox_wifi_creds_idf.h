@@ -12,8 +12,22 @@ extern "C" {
 #endif
 
 #define WIFI_MAX_NETWORKS 5
-#define WIFI_SSID_MAX_LEN 32
-#define WIFI_PASS_MAX_LEN 64
+
+// Estos son tamaños de BUFFER, no longitudes máximas de contenido: incluyen el
+// terminador. nvs_get_str() exige que el buffer tenga strlen+1 bytes y si no
+// devuelve ESP_ERR_NVS_INVALID_LENGTH; en wifi_creds_load() eso hace `continue`
+// y la red se descarta EN SILENCIO.
+//
+//   - SSID: máximo 32 caracteres por norma 802.11 -> 33 bytes.
+//     Con 32 el caso límite (SSID de 32 caracteres) nunca se cargaba.
+//   - Contraseña: passphrase WPA2 de hasta 63 caracteres, pero también se
+//     acepta una PSK de 64 dígitos hexadecimales -> 65 bytes.
+//
+// El strncpy() posterior hacia wifi_config_t (sta.ssid[32] / sta.password[64])
+// sigue siendo correcto: copia como mucho el tamaño del destino y, en el caso
+// límite, lo deja sin terminador, que es justo el formato que espera ESP-IDF.
+#define WIFI_SSID_MAX_LEN 33
+#define WIFI_PASS_MAX_LEN 65
 #define WIFI_SCAN_MAX_AP 20
 
 typedef struct {
