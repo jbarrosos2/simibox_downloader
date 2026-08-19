@@ -26,7 +26,13 @@ extern "C" {
 #define LEDC_CHANNEL_B          LEDC_CHANNEL_2
 
 esp_err_t led_init(void);
+
+// Raw duty write.  If an animation pattern is active the next frame (<=10 ms)
+// overwrites it — use led_show_solid() for a color that must stay put.
 void led_set_color(uint16_t r, uint16_t g, uint16_t b);
+
+// Static color: cancels the running pattern, then writes the duties.
+void led_show_solid(uint16_t r, uint16_t g, uint16_t b);
 
 // Status patterns
 void led_show_wifi_connecting(void);  // Purple breathing
@@ -39,7 +45,16 @@ void led_show_retry(void);            // Fast blinking red
 // Legacy - color changes with progress (red→orange→yellow→green)
 void led_show_progress(uint8_t percent);
 
-// MUST be called frequently for animations to work!
+// Animation task (Core 1, 100 Hz).  Started automatically by led_init().
+// Without it the animation only advances when someone calls led_update(),
+// which starves it during blocking I/O (esp_http_client_read fills 1.5 MB
+// per call, so the "rainbow" only got ~1 frame every 3 seconds).
+esp_err_t led_start_task(void);
+void led_stop_task(void);
+
+// Steps the animation one frame.  No-op once the animation task is running
+// (the task is then the sole driver); kept for callers that run before
+// led_init() or if task creation failed.
 void led_update(void);
 
 #ifdef __cplusplus

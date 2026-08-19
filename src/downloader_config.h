@@ -6,7 +6,7 @@
 
 // Set to 1 for dev/debug mode, 0 for normal
 #ifndef DOWNLOADER_DEV_MODE
-#define DOWNLOADER_DEV_MODE 1  // ENABLED FOR STANDALONE TESTING
+#define DOWNLOADER_DEV_MODE 0  // ENABLED FOR STANDALONE TESTING
 #endif
 
 // Default test folder if dev mode
@@ -27,8 +27,16 @@
 // SD CARD SETTINGS
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// SD SPI clock. 26.67 MHz (80/3) exceeded the signal-integrity margin on hw v2
+// (SPI bus shared with the RFID, weak pull-ups) and produced intermittent data-CRC
+// read errors mid-download that aborted the whole package. 10 MHz (80/8) is a 2.6×
+// clock reduction — solid margin — at nearly no throughput cost, since the download
+// is network-bound (~760 KB/s). If a marginal card still errors, the runtime
+// fallback ladder in simibox_download.cpp steps down (10→4 MHz) via set_card_clk
+// without remounting. Proven floor is 4 MHz (all cards clean per the margin matrix).
+// Bump back toward 20000 only if you have headroom and want faster provisioning.
 #ifndef SD_SPI_FREQ_KHZ
-#define SD_SPI_FREQ_KHZ 26000
+#define SD_SPI_FREQ_KHZ 10000
 #endif
 
 #ifndef SD_VERBOSE_DIAGNOSTICS

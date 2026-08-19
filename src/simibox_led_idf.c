@@ -9,7 +9,17 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include <math.h>
+
+// Animation task: 100 Hz frame rate, pinned to Core 1 (Core 0 runs WiFi/TLS
+// and the download loop).  Priority 2 = above the main task (1), well below
+// the SD writer (5) and WiFi (23), so it preempts the download loop for the
+// few microseconds a frame costs without disturbing throughput.
+#define LED_TASK_STACK      3072
+#define LED_TASK_PRIORITY   2
+#define LED_TASK_CORE       1
+#define LED_FRAME_MS        10
 
 static const char* TAG = "led";
 
@@ -31,6 +41,16 @@ static struct {
     uint8_t progress_percent;
     bool blink_state;
 } led_state = {0};
+
+// Animation task state.  Pattern setters run on the caller's task while the
+// animation task reads led_state; every field is a naturally-aligned scalar,
+// so writes are atomic on ESP32 and no lock is needed for the state itself.
+// The LEDC registers DO need one — see led_set_color().
+static TaskHandle_t      s_led_task = NULL;
+static SemaphoreHandle_t s_ledc_mutex = NULL;
+static volatile bool     s_led_task_stop = false;
+
+static void led_animate_step(void);
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // HSV to RGB conversion for smooth rainbow
@@ -66,6 +86,17 @@ static void hsv_to_rgb(float h, float s, float v, uint16_t* r, uint16_t* g, uint
 // ═══════════════════════════════════════════════════════════════════════════════
 
 esp_err_t led_init(void) {
+    // Must exist before the first led_set_color() below.
+    if (!s_ledc_mutex) {
+        // Recursive: led_animate_step() holds it across a whole frame and the
+        // pattern handlers call led_set_color(), which takes it again.
+        s_ledc_mutex = xSemaphoreCreateRecursiveMutex();
+        if (!s_ledc_mutex) {
+            ESP_LOGE(TAG, "Cannot create LEDC mutex");
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
     ledc_timer_config_t ledc_timer = {
         .speed_mode       = LEDC_MODE,
         .timer_num        = LEDC_TIMER,
@@ -107,23 +138,95 @@ esp_err_t led_init(void) {
     }
     
     led_set_color(0, 0, 0);
-    
+
     ESP_LOGI(TAG, "LED initialized (R=%d, G=%d, B=%d)", LED_R_PIN, LED_G_PIN, LED_B_PIN);
-    return ESP_OK;
+
+    return led_start_task();
 }
 
 void led_set_color(uint16_t r, uint16_t g, uint16_t b) {
     r = (r > LEDC_MAX_DUTY) ? LEDC_MAX_DUTY : r;
     g = (g > LEDC_MAX_DUTY) ? LEDC_MAX_DUTY : g;
     b = (b > LEDC_MAX_DUTY) ? LEDC_MAX_DUTY : b;
-    
+
+    // Serialize the six LEDC register writes: the animation task and the
+    // direct callers in downloader_main.cpp can hit them concurrently.
+    if (s_ledc_mutex) xSemaphoreTakeRecursive(s_ledc_mutex, portMAX_DELAY);
+
     ledc_set_duty(LEDC_MODE, LEDC_CHANNEL_R, r);
     ledc_set_duty(LEDC_MODE, LEDC_CHANNEL_G, g);
     ledc_set_duty(LEDC_MODE, LEDC_CHANNEL_B, b);
-    
+
     ledc_update_duty(LEDC_MODE, LEDC_CHANNEL_R);
     ledc_update_duty(LEDC_MODE, LEDC_CHANNEL_G);
     ledc_update_duty(LEDC_MODE, LEDC_CHANNEL_B);
+
+    if (s_ledc_mutex) xSemaphoreGiveRecursive(s_ledc_mutex);
+}
+
+/**
+ * Static color that survives: stops the running animation first.
+ *
+ * Plain led_set_color() is not enough once the animation task exists — the
+ * next frame (<=10 ms later) would repaint whatever pattern is still active.
+ * Taking the mutex around both the pattern store and the duty write makes it
+ * atomic against a frame in flight.
+ */
+void led_show_solid(uint16_t r, uint16_t g, uint16_t b) {
+    if (s_ledc_mutex) xSemaphoreTakeRecursive(s_ledc_mutex, portMAX_DELAY);
+    led_state.pattern = LED_PATTERN_NONE;
+    led_set_color(r, g, b);
+    if (s_ledc_mutex) xSemaphoreGiveRecursive(s_ledc_mutex);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ANIMATION TASK
+// ═══════════════════════════════════════════════════════════════════════════════
+
+static void led_task(void* arg) {
+    (void)arg;
+    ESP_LOGI(TAG, "LED animation task started on core %d (%d Hz)",
+             xPortGetCoreID(), 1000 / LED_FRAME_MS);
+
+    TickType_t last_wake = xTaskGetTickCount();
+    while (!s_led_task_stop) {
+        led_animate_step();
+        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(LED_FRAME_MS));
+    }
+
+    ESP_LOGI(TAG, "LED animation task exiting");
+    s_led_task = NULL;
+    vTaskDelete(NULL);
+}
+
+esp_err_t led_start_task(void) {
+    if (s_led_task) return ESP_OK;  // Idempotent
+
+    s_led_task_stop = false;
+    BaseType_t ret = xTaskCreatePinnedToCore(
+        led_task,
+        "led_anim",
+        LED_TASK_STACK,
+        NULL,
+        LED_TASK_PRIORITY,
+        &s_led_task,
+        LED_TASK_CORE
+    );
+
+    if (ret != pdPASS) {
+        // Not fatal: led_update() still animates when called manually.
+        s_led_task = NULL;
+        ESP_LOGE(TAG, "Failed to create LED task - falling back to manual led_update()");
+        return ESP_ERR_NO_MEM;
+    }
+
+    return ESP_OK;
+}
+
+void led_stop_task(void) {
+    if (!s_led_task) return;
+    s_led_task_stop = true;
+    vTaskDelay(pdMS_TO_TICKS(LED_FRAME_MS * 3));  // Let it exit cleanly
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -183,13 +286,28 @@ void led_show_progress(uint8_t percent) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// ANIMATION UPDATE - Call frequently in your main loop!
+// ANIMATION UPDATE
 // ═══════════════════════════════════════════════════════════════════════════════
 
+/**
+ * Legacy entry point.  Once led_task is running it owns the animation, so
+ * calls from other tasks are dropped — otherwise every frame would be stepped
+ * twice (once by the task, once by the caller) and the rainbow would run at
+ * double speed.  Still functional as a fallback if the task never started.
+ */
 void led_update(void) {
+    if (s_led_task && xTaskGetCurrentTaskHandle() != s_led_task) return;
+    led_animate_step();
+}
+
+static void led_animate_step(void) {
     uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
     uint32_t elapsed = now - led_state.last_update;
-    
+
+    // Held for the whole frame so led_show_solid() can't be overwritten by a
+    // frame that already read the old pattern.
+    if (s_ledc_mutex) xSemaphoreTakeRecursive(s_ledc_mutex, portMAX_DELAY);
+
     switch (led_state.pattern) {
         
         // ─────────────────────────────────────────────────────────────────────
@@ -318,4 +436,6 @@ void led_update(void) {
             // Static color, no animation needed
             break;
     }
+
+    if (s_ledc_mutex) xSemaphoreGiveRecursive(s_ledc_mutex);
 }

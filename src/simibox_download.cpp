@@ -1,21 +1,21 @@
-/* simibox_download.cpp - EXPERIMENTAL: Two-Phase Double-Buffer Downloader
+/* simibox_download.cpp - EXPERIMENTAL: Async Ping-Pong Double-Buffer Downloader
  *
- * STRATEGY: Decouple network from SD card completely.
+ * STRATEGY: Overlap network and SD writes using two PSRAM buffers + FreeRTOS task.
  *
- *   Phase 1 (NET→PSRAM): Download up to 3 MB into PSRAM staging buffer.
- *           No SD writes.  WiFi/TLS gets 100% of CPU and SPI bus.
- *           TCP window stays open → maximum throughput.
+ *   Two 1.5 MB buffers (A and B) in PSRAM.
+ *   Main task (Core 0): downloads via HTTP/TLS into one buffer.
+ *   SD writer task (Core 1): writes the other buffer to SD simultaneously.
  *
- *   Phase 2 (PSRAM→SD):  Bulk-write the staging buffer to SD card.
- *           No network reads.  SD gets huge sequential write → fastest pattern.
- *           WiFi is idle, no ACK pressure.
+ *   Timeline for a 6 MB file:
+ *     [Net fills A: 3.7s] → [Net fills B: 3.5s] ───────────────────→ done
+ *                           [SD writes A: 2.3s] [SD writes B: 2.0s]
+ *     Total: ~7.5s (vs 12s sequential) — SD is completely hidden.
  *
- * For a 6 MB file this does 2 cycles.  Each cycle downloads at peak TLS speed,
- * then writes at peak SD speed.  The two never fight for the SPI bus.
- *
- * OTHER FIXES IN THIS VERSION:
- * - HTTP connection reuse actually works (don't close() between files)
- * - Per-phase timing instrumentation (net_time vs sd_time per file)
+ * PREVIOUS OPTIMIZATIONS RETAINED:
+ * - HTTP connection reuse (no TLS handshake between files)
+ * - Stale connection retry
+ * - DRAM bounce buffer for SD DMA efficiency
+ * - Per-phase timing instrumentation
  *
  * HW v2: No SD power switch (CJL2623 removed, GPIO13 is now AMP_SD_PIN).
  * SD card is always powered from 3.3V rail via TPS63001.
@@ -33,6 +33,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
+#include "freertos/semphr.h"
 #include "driver/sdspi_host.h"
 #include "driver/spi_common.h"
 #include "sdmmc_cmd.h"
@@ -74,6 +75,39 @@ static const char* TAG = "simibox_download";
 static sdmmc_card_t* s_card = nullptr;
 static bool s_spi_bus_initialized = false;
 
+// SD SPI clock currently in effect (kHz). Tracks the frequency the card was
+// mounted at, and is lowered by the runtime CRC-recovery path below.
+static int s_sd_freq_khz = SD_SPI_FREQ_KHZ;
+
+// SD SPI clock fallback ladder (kHz), highest→lowest. Real ESP32 SPI divisors:
+// 20000=80/4, 10000=80/8, 4000=80/20. Used by the runtime CRC-recovery path to
+// step the clock down instead of aborting the whole download.
+static const int SD_FREQ_LADDER[] = { 20000, 10000, 4000 };
+
+// Return the highest ladder frequency strictly below `cur`, or -1 if `cur` is
+// already at/below the floor.
+static int sd_next_lower_freq(int cur) {
+    for (size_t i = 0; i < sizeof(SD_FREQ_LADDER) / sizeof(SD_FREQ_LADDER[0]); i++) {
+        if (SD_FREQ_LADDER[i] < cur) return SD_FREQ_LADDER[i];
+    }
+    return -1;
+}
+
+// Change the SD SPI clock on an ALREADY-mounted card, no remount required
+// (ESP-IDF quantizes to the nearest 80/N divisor ≤ freq_khz). Returns false if
+// the host has no set_card_clk hook or the call fails.
+static bool set_sd_freq(int freq_khz) {
+    if (!s_card || !s_card->host.set_card_clk) return false;
+    esp_err_t err = s_card->host.set_card_clk(s_card->host.slot, freq_khz);
+    if (err != ESP_OK) {
+        ESP_LOGE("simibox_download", "set_card_clk(%d kHz) failed: %s",
+                 freq_khz, esp_err_to_name(err));
+        return false;
+    }
+    ESP_LOGW("simibox_download", "SD SPI clock lowered to %d kHz", freq_khz);
+    return true;
+}
+
 // ───────────────────────── HTTP Connection Pool ──────────────────────────────
 static esp_http_client_handle_t s_http_client = nullptr;
 static std::string s_http_base_host;
@@ -82,9 +116,26 @@ static std::string s_http_base_host;
 static int64_t s_total_expected_bytes = 0;
 static int64_t s_total_downloaded_bytes = 0;
 
-// ───────────────────────── PSRAM Staging Buffer ─────────────────────────────
-static uint8_t* s_psram_buffer = nullptr;
-static size_t   s_psram_buffer_size = 0;
+// ───────────────────────── PSRAM Ping-Pong Buffers ──────────────────────────
+// Two buffers in PSRAM: while net fills one, SD writer drains the other.
+static uint8_t* s_buf[2] = { nullptr, nullptr };
+static size_t   s_buf_capacity = 0;  // capacity of each half
+
+// ───────────────────────── SD Writer Task ───────────────────────────────────
+// Runs on Core 1.  Waits for a buffer to be ready, writes it to SD, signals done.
+struct SdWriteJob {
+    FILE*          file;
+    const uint8_t* data;
+    size_t         len;
+    volatile bool  sd_error;
+    volatile bool  done;
+    SemaphoreHandle_t sem_job_ready;   // net → SD: "here's a buffer to write"
+    SemaphoreHandle_t sem_job_done;    // SD → net: "I finished writing"
+    volatile bool  stop;               // net → SD: "shut down"
+};
+
+static SdWriteJob s_sd_job;
+static TaskHandle_t s_sd_task_handle = nullptr;
 
 // Static buffer for file I/O (stays in .bss → internal DRAM)
 static char s_file_buffer[16384];
@@ -393,25 +444,27 @@ bool simibox_download::mount_sd(const char* mount_point) {
     mount_config.max_files = 5;
     mount_config.allocation_unit_size = 32 * 1024;
     
-    const int max_retries = 3;
-    int current_freq = SD_SPI_FREQ_KHZ;
-    
-    for (int retry = 0; retry < max_retries; retry++) {
-        if (retry > 0) {
-            ESP_LOGW(TAG, "Mount retry %d/%d", retry + 1, max_retries);
+    // Mount retry ladder: try the configured clock first, then step down for
+    // marginal cards / signal-integrity issues, ending at 400 kHz (SD init speed)
+    // as a last resort — replacing the old all-or-nothing 26 MHz→400 kHz jump.
+    const int mount_ladder[] = { SD_SPI_FREQ_KHZ, 10000, 4000, 400 };
+    int prev_freq = 1000000;  // above any real SD clock, so the first rung always runs
+    for (size_t i = 0; i < sizeof(mount_ladder) / sizeof(mount_ladder[0]); i++) {
+        int freq = mount_ladder[i];
+        if (freq >= prev_freq) continue;   // only ever step downward; skip dup/higher rungs
+        prev_freq = freq;
+
+        if (i > 0) {
+            ESP_LOGW(TAG, "Mount retry at %d kHz", freq);
             gpio_set_level((gpio_num_t)SD_CS_PIN, 1);
-            vTaskDelay(pdMS_TO_TICKS(200 * retry));
-            
-            if (retry >= 2 && current_freq > 400) {
-                current_freq = 400;
-                host.max_freq_khz = current_freq;
-                ESP_LOGW(TAG, "Reducing SPI to %d kHz", current_freq);
-            }
+            vTaskDelay(pdMS_TO_TICKS(200 * (int)i));
         }
-        
+        host.max_freq_khz = freq;
+
         ret = esp_vfs_fat_sdspi_mount(mount_point, &host, &slot_config, &mount_config, &s_card);
-        
+
         if (ret == ESP_OK) {
+            s_sd_freq_khz = freq;   // remember the mounted clock for the runtime fallback
             int64_t elapsed_ms = (esp_timer_get_time() - mount_start) / 1000;
             ESP_LOGI(TAG, "SD card mounted successfully (%lld ms)", elapsed_ms);
             ESP_LOGI(TAG, "  Card: %.8s, %lu MB, actual freq: %d kHz",
@@ -423,8 +476,8 @@ bool simibox_download::mount_sd(const char* mount_point) {
                      (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
             return true;
         }
-        
-        ESP_LOGE(TAG, "Mount failed: %s", esp_err_to_name(ret));
+
+        ESP_LOGE(TAG, "Mount failed at %d kHz: %s", freq, esp_err_to_name(ret));
     }
     
     spi_bus_free(SPI2_HOST);
@@ -675,35 +728,136 @@ static void cleanup_http_pool() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// PSRAM Staging Buffer Management
+// PSRAM Ping-Pong Buffer Management
 // ═══════════════════════════════════════════════════════════════════════════════
 
-static void ensure_psram_buffer(void) {
-    if (s_psram_buffer) return;  // Already allocated
+static void ensure_pingpong_buffers(void) {
+    if (s_buf[0]) return;  // Already allocated
     
-    // Try requested size first, then fall back to smaller
-    size_t try_sizes[] = { PSRAM_STAGING_BUFFER_SIZE, 2*1024*1024, 1*1024*1024, 512*1024 };
+    // Try half-sizes: 1.5 MB, 1 MB, 512 KB per buffer
+    size_t try_halves[] = { PSRAM_STAGING_BUFFER_SIZE / 2, 1*1024*1024, 512*1024 };
     
-    for (size_t i = 0; i < sizeof(try_sizes)/sizeof(try_sizes[0]); i++) {
-        s_psram_buffer = (uint8_t*)heap_caps_malloc(try_sizes[i], MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (s_psram_buffer) {
-            s_psram_buffer_size = try_sizes[i];
-            ESP_LOGI(TAG, "PSRAM staging buffer: %zu KB allocated", s_psram_buffer_size / 1024);
+    for (size_t i = 0; i < sizeof(try_halves)/sizeof(try_halves[0]); i++) {
+        s_buf[0] = (uint8_t*)heap_caps_malloc(try_halves[i], MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        s_buf[1] = (uint8_t*)heap_caps_malloc(try_halves[i], MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (s_buf[0] && s_buf[1]) {
+            s_buf_capacity = try_halves[i];
+            ESP_LOGI(TAG, "Ping-pong buffers: 2 x %zu KB in PSRAM", s_buf_capacity / 1024);
             ESP_LOGI(TAG, "  PSRAM remaining: %lu KB",
                      (unsigned long)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
             return;
         }
+        // Partial alloc — free and try smaller
+        if (s_buf[0]) { free(s_buf[0]); s_buf[0] = nullptr; }
+        if (s_buf[1]) { free(s_buf[1]); s_buf[1] = nullptr; }
     }
     
-    ESP_LOGE(TAG, "CRITICAL: Cannot allocate PSRAM staging buffer!");
+    ESP_LOGE(TAG, "CRITICAL: Cannot allocate ping-pong buffers!");
 }
 
-static void free_psram_buffer(void) {
-    if (s_psram_buffer) {
-        free(s_psram_buffer);
-        s_psram_buffer = nullptr;
-        s_psram_buffer_size = 0;
+static void free_pingpong_buffers(void) {
+    for (int i = 0; i < 2; i++) {
+        if (s_buf[i]) { free(s_buf[i]); s_buf[i] = nullptr; }
     }
+    s_buf_capacity = 0;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SD Writer Task — runs on Core 1, writes buffers to SD in background
+// ═══════════════════════════════════════════════════════════════════════════════
+
+static void sd_writer_task(void* arg) {
+    SdWriteJob* job = (SdWriteJob*)arg;
+    // DRAM bounce buffer for DMA-friendly SD writes (static, stays in .bss)
+    static uint8_t dram_bounce[32768];
+    
+    ESP_LOGI(TAG, "SD writer task started on core %d", xPortGetCoreID());
+    
+    while (true) {
+        // Wait for net task to hand us a buffer
+        xSemaphoreTake(job->sem_job_ready, portMAX_DELAY);
+        
+        if (job->stop) break;  // Clean shutdown
+        
+        // Write the buffer to SD using DRAM bounce (same pattern as before)
+        const uint8_t* data = job->data;
+        size_t remaining = job->len;
+        size_t offset = 0;
+        bool error = false;
+        
+        while (offset < remaining) {
+            size_t chunk = (remaining - offset > sizeof(dram_bounce))
+                           ? sizeof(dram_bounce) : (remaining - offset);
+            
+            memcpy(dram_bounce, data + offset, chunk);
+            size_t written = fwrite(dram_bounce, 1, chunk, job->file);
+            
+            if (written != chunk) {
+                ESP_LOGW(TAG, "  SD write stall (%zu/%zu), retrying...", written, chunk);
+                vTaskDelay(pdMS_TO_TICKS(50));
+                size_t w2 = fwrite(dram_bounce + written, 1, chunk - written, job->file);
+                if (written + w2 != chunk) {
+                    ESP_LOGE(TAG, "  SD write FAILED at offset %zu", offset);
+                    error = true;
+                    break;
+                }
+            }
+            
+            offset += chunk;
+            vTaskDelay(pdMS_TO_TICKS(1));  // Let watchdog/timers run
+        }
+        
+        job->sd_error = error;
+        job->done = true;
+        
+        // Signal net task: "I'm done with this buffer"
+        xSemaphoreGive(job->sem_job_done);
+    }
+    
+    ESP_LOGI(TAG, "SD writer task exiting");
+    vTaskDelete(nullptr);
+}
+
+static bool start_sd_writer_task(void) {
+    s_sd_job.sem_job_ready = xSemaphoreCreateBinary();
+    s_sd_job.sem_job_done = xSemaphoreCreateBinary();
+    s_sd_job.stop = false;
+    s_sd_job.sd_error = false;
+    s_sd_job.done = true;
+    
+    if (!s_sd_job.sem_job_ready || !s_sd_job.sem_job_done) {
+        ESP_LOGE(TAG, "Failed to create semaphores");
+        return false;
+    }
+    
+    // Pin to Core 1 — Core 0 is busy with WiFi/TLS
+    BaseType_t ret = xTaskCreatePinnedToCore(
+        sd_writer_task,
+        "sd_writer",
+        4096,           // Stack size (only needs bounce buffer + fwrite overhead)
+        &s_sd_job,
+        5,              // Priority (moderate — below WiFi at 23)
+        &s_sd_task_handle,
+        1               // Core 1
+    );
+    
+    if (ret != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create SD writer task");
+        return false;
+    }
+    
+    return true;
+}
+
+static void stop_sd_writer_task(void) {
+    if (s_sd_task_handle) {
+        s_sd_job.stop = true;
+        xSemaphoreGive(s_sd_job.sem_job_ready);  // Wake it up to exit
+        vTaskDelay(pdMS_TO_TICKS(100));  // Let it clean up
+        s_sd_task_handle = nullptr;
+    }
+    if (s_sd_job.sem_job_ready) { vSemaphoreDelete(s_sd_job.sem_job_ready); s_sd_job.sem_job_ready = nullptr; }
+    if (s_sd_job.sem_job_done)  { vSemaphoreDelete(s_sd_job.sem_job_done);  s_sd_job.sem_job_done = nullptr; }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -725,52 +879,11 @@ static void update_led_progress(void) {
 
 enum class DlResult { OK, SD_FAILED, NET_FAILED, OTHER_FAILED };
 
-/**
- * Write a chunk of data from PSRAM to an open file on SD.
- * Breaks large writes into SD_WRITE_CHUNK_SIZE pieces with yields
- * so FreeRTOS system tasks can run.
- * Returns false if SD write fails.
- */
-static bool bulk_write_to_sd(FILE* f, const uint8_t* data, size_t len) {
-    // Buffer estático en DRAM (.bss). 32KB es el límite óptimo para el DMA
-    static uint8_t dram_bounce_buffer[32768]; 
-    
-    size_t offset = 0;
-    while (offset < len) {
-        size_t chunk = (len - offset > sizeof(dram_bounce_buffer)) 
-                       ? sizeof(dram_bounce_buffer) : (len - offset);
-        
-        // Copia rapidísima de PSRAM a DRAM usando la CPU
-        memcpy(dram_bounce_buffer, data + offset, chunk);
-        
-        // Escritura eficiente a SD desde DRAM, permitiendo DMA directo
-        size_t written = fwrite(dram_bounce_buffer, 1, chunk, f);
-        
-        if (written != chunk) {
-            ESP_LOGW(TAG, "  SD write stall (%zu/%zu), retrying...", written, chunk);
-            vTaskDelay(pdMS_TO_TICKS(50));
-            size_t w2 = fwrite(dram_bounce_buffer + written, 1, chunk - written, f);
-            if (written + w2 != chunk) {
-                ESP_LOGE(TAG, "  SD write FAILED at offset %zu", offset);
-                return false;
-            }
-        }
-        
-        offset += chunk;
-        
-        // Breve pausa para el watchdog
-        vTaskDelay(pdMS_TO_TICKS(1)); 
-    }
-    return true;
-}
 static DlResult download_file_standalone(const std::string& url, const std::string& out_path) {
     int64_t t0 = esp_timer_get_time();
     std::string out_part = out_path + ".part";
     
     // ─────── HTTP setup with stale-connection retry ───────
-    // The keep-alive connection may have died during the SD write phase
-    // (server closed it after idle timeout).  If open() or fetch_headers()
-    // fails, destroy the stale client and create a fresh one.
     esp_http_client_handle_t client = nullptr;
     int64_t clen = 0;
     
@@ -785,8 +898,8 @@ static DlResult download_file_standalone(const std::string& url, const std::stri
         if (err != ESP_OK) {
             if (attempt == 0) {
                 ESP_LOGW(TAG, "  Connection stale, reconnecting...");
-                release_http_client(client, true);  // Destroy stale client
-                continue;  // Retry with fresh connection
+                release_http_client(client, true);
+                continue;
             }
             ESP_LOGE(TAG, "HTTP open failed: %s", esp_err_to_name(err));
             release_http_client(client, true);
@@ -796,10 +909,9 @@ static DlResult download_file_standalone(const std::string& url, const std::stri
         clen = esp_http_client_fetch_headers(client);
         int status = esp_http_client_get_status_code(client);
         
-        if (status == 200) break;  // Success
+        if (status == 200) break;
         
         if (status <= 0 && attempt == 0) {
-            // Stale connection returned garbage — retry with fresh
             ESP_LOGW(TAG, "  Bad status %d on reused connection, reconnecting...", status);
             release_http_client(client, true);
             continue;
@@ -814,9 +926,9 @@ static DlResult download_file_standalone(const std::string& url, const std::stri
         ESP_LOGI(TAG, "  Size: %" PRId64 " bytes (%.1f MB)", clen, clen / (1024.0 * 1024.0));
     }
     
-    // ─────── Ensure PSRAM staging buffer ───────
-    ensure_psram_buffer();
-    if (!s_psram_buffer) {
+    // ─────── Ensure ping-pong buffers + SD writer task ───────
+    ensure_pingpong_buffers();
+    if (!s_buf[0] || !s_buf[1]) {
         release_http_client(client, true);
         return DlResult::OTHER_FAILED;
     }
@@ -830,29 +942,46 @@ static DlResult download_file_standalone(const std::string& url, const std::stri
     }
     setvbuf(f, s_file_buffer, _IOFBF, sizeof(s_file_buffer));
     
-    // ─────── Two-phase download loop ───────
+    // Start SD writer task if not already running
+    if (!s_sd_task_handle) {
+        if (!start_sd_writer_task()) {
+            fclose(f);
+            release_http_client(client, true);
+            return DlResult::OTHER_FAILED;
+        }
+    }
+    s_sd_job.file = f;
+    
+    // ─────── Async ping-pong download loop ───────
+    //
+    // While net fills buf[cur], SD writer drains buf[prev] in parallel.
+    // The SD write (~2.3s) is completely hidden behind the net download (~3.7s).
+    //
     int total = 0;
     bool net_error = false;
     bool sd_error = false;
     int64_t net_time_us = 0;
     int64_t sd_time_us = 0;
+    int64_t overlap_time_us = 0;
     int cycle_count = 0;
+    int cur = 0;              // Buffer index being filled by net (0 or 1)
+    bool sd_write_pending = false;  // Is the SD task currently writing?
+    int64_t sd_write_start = 0;
     
     while (true) {
         // ═══════════════════════════════════════════════════════════════════
-        // PHASE 1: NETWORK → PSRAM
+        // PHASE 1: NETWORK → PSRAM buf[cur]
         //
-        // Fill the staging buffer from HTTP/TLS.
-        // NO SD writes happen here.  WiFi/TLS gets 100% of CPU time.
-        // TCP window stays open, ACKs flow freely, max throughput.
+        // While this runs, the SD writer task may be writing buf[1-cur]
+        // on Core 1 simultaneously.  Net gets full Core 0 CPU time.
         // ═══════════════════════════════════════════════════════════════════
         size_t buf_filled = 0;
         int64_t phase1_start = esp_timer_get_time();
         
-        while (buf_filled < s_psram_buffer_size) {
+        while (buf_filled < s_buf_capacity) {
             int n = esp_http_client_read(client, 
-                (char*)s_psram_buffer + buf_filled,
-                s_psram_buffer_size - buf_filled);
+                (char*)s_buf[cur] + buf_filled,
+                s_buf_capacity - buf_filled);
             
             if (n < 0) {
                 ESP_LOGE(TAG, "  HTTP read error at total offset %d", total);
@@ -865,7 +994,6 @@ static DlResult download_file_standalone(const std::string& url, const std::stri
             total += n;
             s_total_downloaded_bytes += n;
             
-            // Update LED periodically (cheap — no SD, just LEDC registers)
             update_led_progress();
         }
         
@@ -874,36 +1002,77 @@ static DlResult download_file_standalone(const std::string& url, const std::stri
         
         if (net_error || buf_filled == 0) break;
         
-        // Log phase 1 speed
-        double phase1_kbs = (buf_filled / 1024.0) / (phase1_us / 1e6);
         cycle_count++;
+        double phase1_kbs = (buf_filled / 1024.0) / (phase1_us / 1e6);
         ESP_LOGI(TAG, "  Cycle %d: downloaded %zu KB in %.1fs (%.0f KB/s net)",
                  cycle_count, buf_filled / 1024, phase1_us / 1e6, phase1_kbs);
         
         // ═══════════════════════════════════════════════════════════════════
-        // PHASE 2: PSRAM → SD CARD
+        // WAIT for previous SD write to finish (if any).
         //
-        // Bulk-write the entire staging buffer to SD.
-        // NO network reads happen here.  SD gets a big sequential write
-        // which is the fastest access pattern for flash storage.
-        // WiFi is idle — TCP connection stays alive via keep-alive.
+        // Because SD (~1.3 MB/s, ~2.3s) is faster than net (~830 KB/s, ~3.7s),
+        // the SD task should already be done by now.  This wait costs ~0ms
+        // in the steady state.  Only the very first cycle has no overlap.
         // ═══════════════════════════════════════════════════════════════════
-        int64_t phase2_start = esp_timer_get_time();
-        
-        if (!bulk_write_to_sd(f, s_psram_buffer, buf_filled)) {
-            sd_error = true;
-            break;
+        if (sd_write_pending) {
+            int64_t wait_start = esp_timer_get_time();
+            xSemaphoreTake(s_sd_job.sem_job_done, portMAX_DELAY);
+            int64_t wait_us = esp_timer_get_time() - wait_start;
+            
+            int64_t prev_sd_us = esp_timer_get_time() - sd_write_start;
+            sd_time_us += prev_sd_us;
+            
+            // Overlap = how much of the SD write happened during our net download
+            int64_t this_overlap = (prev_sd_us > wait_us) ? (prev_sd_us - wait_us) : prev_sd_us;
+            overlap_time_us += this_overlap;
+            
+            sd_write_pending = false;
+            
+            if (s_sd_job.sd_error) {
+                ESP_LOGE(TAG, "  SD writer reported error");
+                sd_error = true;
+                break;
+            }
+            
+            if (wait_us > 10000) {  // More than 10ms wait = net had to stall
+                ESP_LOGW(TAG, "  Net waited %.0fms for SD to finish", wait_us / 1e3);
+            }
         }
         
-        int64_t phase2_us = esp_timer_get_time() - phase2_start;
-        sd_time_us += phase2_us;
+        // ═══════════════════════════════════════════════════════════════════
+        // KICK OFF SD write for buf[cur] in background.
+        // Net will immediately start filling buf[1-cur] in the next iteration.
+        // ═══════════════════════════════════════════════════════════════════
+        s_sd_job.data = s_buf[cur];
+        s_sd_job.len = buf_filled;
+        s_sd_job.sd_error = false;
+        s_sd_job.done = false;
+        sd_write_start = esp_timer_get_time();
+        sd_write_pending = true;
+        xSemaphoreGive(s_sd_job.sem_job_ready);
         
-        double phase2_kbs = (buf_filled / 1024.0) / (phase2_us / 1e6);
-        ESP_LOGI(TAG, "  Cycle %d: wrote %zu KB in %.1fs (%.0f KB/s SD)",
-                 cycle_count, buf_filled / 1024, phase2_us / 1e6, phase2_kbs);
+        // Swap buffers: net will fill the other one next
+        cur = 1 - cur;
         
-        // If we got less than a full buffer, we hit EOF in phase 1
-        if (buf_filled < s_psram_buffer_size) break;
+        // If we got less than a full buffer, we hit EOF — no more net reads
+        if (buf_filled < s_buf_capacity) break;
+    }
+    
+    // ─────── Wait for final SD write to complete ───────
+    if (sd_write_pending) {
+        int64_t wait_start = esp_timer_get_time();
+        xSemaphoreTake(s_sd_job.sem_job_done, portMAX_DELAY);
+        int64_t final_sd_us = esp_timer_get_time() - sd_write_start;
+        sd_time_us += final_sd_us;
+        sd_write_pending = false;
+        
+        if (s_sd_job.sd_error) {
+            sd_error = true;
+        }
+        
+        int64_t wait_us = esp_timer_get_time() - wait_start;
+        ESP_LOGI(TAG, "  Final SD write: %.1fs (waited %.0fms)",
+                 final_sd_us / 1e6, wait_us / 1e3);
     }
     
     // ─────── Close HTTP (keep connection for reuse if no error) ───────
@@ -948,16 +1117,17 @@ static DlResult download_file_standalone(const std::string& url, const std::stri
     double total_kbs = (total / 1024.0) / (total_sec > 0 ? total_sec : 1);
     double net_sec = net_time_us / 1e6;
     double sd_sec = sd_time_us / 1e6;
+    double overlap_sec = overlap_time_us / 1e6;
     
     size_t slash_pos = out_path.rfind('/');
     std::string filename = (slash_pos != std::string::npos) ? out_path.substr(slash_pos + 1) : out_path;
     
     ESP_LOGI(TAG, "✓ %s (%.1f MB) in %.1fs → %.0f KB/s", 
              filename.c_str(), total / (1024.0 * 1024.0), total_sec, total_kbs);
-    ESP_LOGI(TAG, "    Breakdown: net=%.1fs (%.0f KB/s), SD=%.1fs (%.0f KB/s), overhead=%.1fs",
+    ESP_LOGI(TAG, "    net=%.1fs (%.0f KB/s), SD=%.1fs (%.0f KB/s), overlap=%.1fs saved",
              net_sec, (total / 1024.0) / (net_sec > 0 ? net_sec : 1),
              sd_sec, (total / 1024.0) / (sd_sec > 0 ? sd_sec : 1),
-             total_sec - net_sec - sd_sec);
+             overlap_sec);
     
     update_led_progress();
     return DlResult::OK;
@@ -1064,8 +1234,8 @@ bool simibox_download::download_simi_folder(const std::string& folder,
 
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, "═══════════════════════════════════════════════════════════════");
-    ESP_LOGI(TAG, "  DOWNLOADING %d FILES (two-phase: NET→PSRAM→SD)", (int)file_list.size());
-    ESP_LOGI(TAG, "  Staging buffer: %zu KB in PSRAM", PSRAM_STAGING_BUFFER_SIZE / 1024);
+    ESP_LOGI(TAG, "  DOWNLOADING %d FILES (async ping-pong: NET↔SD parallel)", (int)file_list.size());
+    ESP_LOGI(TAG, "  Ping-pong buffers: 2 x %zu KB in PSRAM", PSRAM_STAGING_BUFFER_SIZE / 2 / 1024);
     ESP_LOGI(TAG, "═══════════════════════════════════════════════════════════════");
 
     // 3) Download all files
@@ -1084,7 +1254,23 @@ bool simibox_download::download_simi_folder(const std::string& folder,
         
         std::string out_final = tmp_dir + "/" + name;
         
+        // Download with SD-clock fallback. A data-CRC error at high SPI clock
+        // (signal-integrity margin on hw v2) surfaces as SD_FAILED. Instead of
+        // aborting the whole package on the first hiccup, step the SPI clock down
+        // (no remount, via set_card_clk) and retry this same file. Net/other
+        // failures are NOT retried this way — only genuine SD errors.
         DlResult result = download_file_standalone(url, out_final);
+        while (result == DlResult::SD_FAILED) {
+            int lower = sd_next_lower_freq(s_sd_freq_khz);
+            if (lower < 0) break;                       // already at the clock floor
+            ESP_LOGW(TAG, "SD error on '%s' at %d kHz — lowering clock and retrying",
+                     name.c_str(), s_sd_freq_khz);
+            if (!set_sd_freq(lower)) break;             // host can't change clock → give up
+            s_sd_freq_khz = lower;
+            remove((out_final + ".part").c_str());      // drop the partial before retry
+            vTaskDelay(pdMS_TO_TICKS(150));
+            result = download_file_standalone(url, out_final);
+        }
         if (result != DlResult::OK) {
             ESP_LOGE(TAG, "Failed to download: %s", name.c_str());
             if (result == DlResult::SD_FAILED) sd_failed = true;
@@ -1101,7 +1287,8 @@ bool simibox_download::download_simi_folder(const std::string& folder,
     
     // Cleanup
     cleanup_http_pool();
-    free_psram_buffer();
+    stop_sd_writer_task();
+    free_pingpong_buffers();
     
     if (!all_ok) {
         ESP_LOGE(TAG, "Download failed after %d files", files_downloaded);
