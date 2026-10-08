@@ -147,44 +147,50 @@ static bool connect_to_wifi_with_feedback(void) {
     }
     
     // ═══════════════════════════════════════════════════════════════════════════
-    // FIX: Use wifi_creds_connect_auto() instead of wifi_creds_connect_best()
-    // 
-    // This function:
-    // 1. First waits for ESP32's auto-connect (it remembers from musicbox!)
-    // 2. If auto-connect fails, falls back to our saved networks
-    // 
-    // The old code failed because it checked OUR NVS namespace for saved
-    // networks, but the ESP32 driver already auto-connected using ITS
-    // internal storage. By the time we declared "no networks found",
-    // the ESP32 was already connected!
+    // Conexión: se dispara PRIMERO, no después de esperar.
+    //
+    // El código anterior asumía que el driver del ESP32 ya se había
+    // auto-conectado con la red que recuerda de musicbox, así que sondeaba
+    // 10 s antes de pedir conexión. Esa premisa ya no se cumple: musicbox corre
+    // IDF 4.4.7 y el downloader IDF 5.4.1, y el blob interno del driver WiFi en
+    // NVS no es compatible entre versiones mayores de IDF. Lo que el driver de
+    // musicbox recordó, el del downloader no lo lee.
+    //
+    // Medido en placa (2026-10-08): 10 s de "Haven't to connect to a suitable
+    // AP now!" cada 100 ms, y recién al llamar al esp_wifi_connect() explícito
+    // conectaba en 1,3 s. Diez segundos perdidos en cada descarga.
+    //
+    // Peor: el disparo estaba dentro de un `if (attempt == 0)`, asi que los
+    // intentos 2 y 3 eran 20 s más de sondeo sin nadie pidiendo conectar.
+    //
+    // Ahora cada intento dispara y espera; la animación del LED la mantiene
+    // viva su propia tarea (led: "animation task started on core 1, 100 Hz").
     // ═══════════════════════════════════════════════════════════════════════════
-    
-    ESP_LOGI(TAG, "Using auto-connect strategy (30s timeout)...");
-    
-    // Keep updating LED while waiting
+
+    const uint32_t CONNECT_TIMEOUT_MS = 10000;
+    ESP_LOGI(TAG, "Conectando (disparo inmediato, timeout %lu ms x3)...",
+             (unsigned long)CONNECT_TIMEOUT_MS);
+
     esp_err_t ret = ESP_FAIL;
-    
-    // Try auto-connect with LED feedback
+
     for (int attempt = 0; attempt < 3 && ret != ESP_OK; attempt++) {
         if (attempt > 0) {
             ESP_LOGW(TAG, "Retry attempt %d...", attempt + 1);
         }
-        
-        // Update LED animation during connection
-        for (int i = 0; i < 100; i++) {  // 10 seconds per attempt
+
+        // Dispara esp_wifi_connect() y espera la IP.
+        ret = wifi_creds_wait_for_connection(CONNECT_TIMEOUT_MS);
+        if (ret == ESP_OK) {
+            break;
+        }
+
+        // Respiro corto entre intentos, sin bloquear si entra tarde la conexión.
+        for (int i = 0; i < 10 && !wifi_creds_is_connected(); i++) {
             led_update();
             vTaskDelay(pdMS_TO_TICKS(100));
-            
-            // Check if connected
-            if (wifi_creds_is_connected()) {
-                ret = ESP_OK;
-                break;
-            }
         }
-        
-        // Trigger connection if not connected yet
-        if (ret != ESP_OK && attempt == 0) {
-            ret = wifi_creds_wait_for_connection(10000);  // 10 seconds
+        if (wifi_creds_is_connected()) {
+            ret = ESP_OK;
         }
     }
     
